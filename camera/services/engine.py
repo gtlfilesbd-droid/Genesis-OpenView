@@ -100,6 +100,13 @@ class Engine:
         self.raw_jpeg = b""
         self.raw_at = 0.0
         self.last_alarm: dict | None = None
+        self._zone_cached = None
+        self._zone_at = 0.0
+        self._last_draw: list[tuple] = []
+        self._last_polygon: list[tuple[float, float]] = []
+        self._face_job = None
+        self._face_lock = threading.Lock()
+        threading.Thread(target=self._face_worker, name="face-match", daemon=True).start()
 
     def ensure_defaults(self) -> None:
         if self._defaults_ready:
@@ -125,6 +132,9 @@ class Engine:
         self._name_scores = {}
         self._votes = {}
         self._name_try_at = {}
+        self._last_draw = []
+        self._last_polygon = []
+        self._zone_at = 0.0
         with self._lock:
             self.camera_number = int(camera_number)
             self.stream = stream if stream in ("sub", "main") else "sub"
@@ -240,7 +250,9 @@ class Engine:
             self._fail(generation, "Set RTSP_URL in .env")
             return
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        weight_name = "yolo11m.pt" if device == "cuda" else "yolo11s.pt"
+        # The small model keeps the CPU preview smooth. CUDA can carry the larger one.
+        weight_name = "yolo11s.pt" if device == "cuda" else "yolo11n.pt"
+        imgsz = 640 if device == "cuda" else 480
         with self._lock:
             if generation != self._generation:
                 return
@@ -266,13 +278,20 @@ class Engine:
                     self.running = True
                     self.starting = False
                     self.error = ""
+            next_infer = 0.0
+            infer_gap = 0.0 if device == "cuda" else 0.15
             while not stop_event.is_set() and generation == self._generation:
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     break
                 seen_frame = True
+                now = time.monotonic()
                 try:
-                    self._handle_frame(model, frame, generation, device)
+                    if now >= next_infer:
+                        next_infer = now + infer_gap
+                        self._handle_frame(model, frame, generation, device, imgsz)
+                    else:
+                        self._publish_preview(frame, generation)
                 except Exception as exc:
                     print("frame error:", type(exc).__name__)
             capture.release()
@@ -303,14 +322,36 @@ class Engine:
                 self.starting = False
 
     def _load_zone(self):
+        now = time.monotonic()
+        if now - self._zone_at < 2:
+            return self._zone_cached
         from camera.models import Zone
 
-        return Zone.objects.filter(camera_number=self.camera_number, active=True).first()
+        self._zone_cached = Zone.objects.filter(camera_number=self.camera_number, active=True).first()
+        self._zone_at = now
+        return self._zone_cached
 
-    def _handle_frame(self, model, frame, generation: int, device: str) -> None:
+    def _publish_preview(self, frame, generation: int) -> None:
+        """Show the newest camera frame with the last boxes, without running the model again."""
+        if generation != self._generation:
+            return
+        plotted = frame.copy()
+        if self._last_polygon:
+            _draw_zone(plotted, self._last_polygon)
+        for coords, text, known in self._last_draw:
+            _draw_box(plotted, coords, text, known)
+        ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if not ok:
+            return
+        with self._lock:
+            if generation == self._generation:
+                self.latest_jpeg = encoded.tobytes()
+
+    def _handle_frame(self, model, frame, generation: int, device: str, imgsz: int) -> None:
         from django.db import close_old_connections
 
-        close_old_connections()
+        if time.monotonic() - self._zone_at >= 2:
+            close_old_connections()
         if generation != self._generation:
             return
         plotted = frame.copy()
@@ -322,7 +363,7 @@ class Engine:
                 frame,
                 persist=True,
                 classes=class_ids,
-                imgsz=640,
+                imgsz=imgsz,
                 conf=0.30,
                 device=device,
                 verbose=False,
@@ -351,10 +392,13 @@ class Engine:
             else:
                 present[track_id] = False
         alarm_ids = self._dwell.update(present, now, dwell_seconds)
-        self._recognize(frame, person_boxes, now)
+        self._queue_face(generation, frame, person_boxes, now)
 
         persons = []
         detections = []
+        draw: list[tuple] = []
+        with self._lock:
+            names = dict(self._names)
         for track_id, coords, class_id, conf in boxes:
             label = label_for(class_id) if class_id in COCO_NAMES else "Object"
             name = ""
@@ -364,7 +408,7 @@ class Engine:
                 elapsed = self._dwell.elapsed(track_id, now)
                 inside = present.get(track_id, False)
                 shown = round(elapsed, 1) if inside and elapsed is not None else 0
-                name = self._names.get(int(track_id), "")
+                name = names.get(int(track_id), "")
                 text = name or "Person"
                 if inside and elapsed is not None:
                     text = f"{text}  {int(elapsed)}s"
@@ -372,8 +416,11 @@ class Engine:
                     {"id": int(track_id), "name": name, "dwell": shown, "inside": inside}
                 )
                 _draw_box(plotted, coords, text, known=bool(name))
+                draw.append((coords, text, bool(name)))
             else:
-                _draw_box(plotted, coords, f"{label} {round(float(conf) * 100)}%", known=False)
+                text = f"{label} {round(float(conf) * 100)}%"
+                _draw_box(plotted, coords, text, known=False)
+                draw.append((coords, text, False))
             detections.append(
                 {
                     "id": int(track_id),
@@ -389,8 +436,13 @@ class Engine:
         if alarm_ids and polygon:
             self._raise_alarms(frame, plotted, person_boxes, alarm_ids)
 
-        ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-        ok_raw, raw = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        self._last_draw = draw
+        self._last_polygon = polygon
+        ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        raw_due = time.time() - self.raw_at >= 1
+        ok_raw, raw = (False, None)
+        if raw_due:
+            ok_raw, raw = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         with self._lock:
             if generation != self._generation:
                 return
@@ -419,55 +471,80 @@ class Engine:
         self._gallery_at = time.monotonic()
         return gallery
 
-    def _recognize(self, frame, person_boxes, now: float) -> None:
-        from .faces import best_match, embed_upper_body, model_ready, next_identity
+    def _queue_face(self, generation: int, frame, person_boxes, now: float) -> None:
+        from .faces import model_ready
 
         live_ids = {int(track_id) for track_id, _coords in person_boxes}
-        self._names = {track_id: name for track_id, name in self._names.items() if track_id in live_ids}
-        self._name_scores = {
-            track_id: score for track_id, score in self._name_scores.items() if track_id in live_ids
-        }
-        self._votes = {track_id: votes for track_id, votes in self._votes.items() if track_id in live_ids}
-        self._name_try_at = {
-            track_id: tried for track_id, tried in self._name_try_at.items() if track_id in live_ids
-        }
-        if not model_ready():
+        with self._lock:
+            self._names = {track_id: name for track_id, name in self._names.items() if track_id in live_ids}
+            self._name_scores = {
+                track_id: score for track_id, score in self._name_scores.items() if track_id in live_ids
+            }
+            self._votes = {track_id: votes for track_id, votes in self._votes.items() if track_id in live_ids}
+            self._name_try_at = {
+                track_id: tried for track_id, tried in self._name_try_at.items() if track_id in live_ids
+            }
+            pending = []
+            for track_id, coords in person_boxes:
+                track_id = int(track_id)
+                wait = 4.0 if track_id in self._names else 1.5
+                if now - self._name_try_at.get(track_id, 0) >= wait:
+                    pending.append((track_id, coords))
+        if not pending or not model_ready():
             return
+        with self._face_lock:
+            if self._face_job is not None:
+                return
+        pending.sort(key=lambda item: self._name_try_at.get(item[0], 0))
+        track_id, coords = pending[0]
+        snapshot = frame.copy()
+        with self._lock:
+            self._name_try_at[track_id] = now
+        with self._face_lock:
+            if self._face_job is None:
+                self._face_job = (generation, snapshot, track_id, coords)
+
+    def _face_worker(self) -> None:
+        while True:
+            with self._face_lock:
+                job = self._face_job
+                self._face_job = None
+            if job is None:
+                time.sleep(0.05)
+                continue
+            generation, frame, track_id, coords = job
+            if generation != self._generation:
+                continue
+            try:
+                self._match_face(frame, track_id, coords)
+            except Exception:
+                print("face match error")
+
+    def _match_face(self, frame, track_id: int, coords) -> None:
+        from .faces import best_match, embed_upper_body, next_identity
+
         gallery = [(person.name, vector) for person, vector in self._gallery_people()]
         if not gallery:
             return
-        pending = []
-        for track_id, coords in person_boxes:
-            track_id = int(track_id)
-            wait = 4.0 if track_id in self._names else 1.5
-            if now - self._name_try_at.get(track_id, 0) >= wait:
-                pending.append((track_id, coords))
-        if not pending:
-            return
-        pending.sort(key=lambda item: self._name_try_at.get(item[0], 0))
-        track_id, coords = pending[0]
-        self._name_try_at[track_id] = now
-        try:
-            found = embed_upper_body(frame, coords)
-        except Exception:
-            return
+        found = embed_upper_body(frame, coords)
         if found is None:
             return
         embedding, _face_box = found
         name, score = best_match(embedding, gallery)
         if not name:
             return
-        votes = self._votes.setdefault(track_id, {})
-        locked, locked_score = next_identity(
-            votes,
-            self._names.get(track_id, ""),
-            self._name_scores.get(track_id, 0.0),
-            name,
-            score,
-        )
-        if locked:
-            self._names[track_id] = locked
-            self._name_scores[track_id] = locked_score
+        with self._lock:
+            votes = self._votes.setdefault(track_id, {})
+            locked, locked_score = next_identity(
+                votes,
+                self._names.get(track_id, ""),
+                self._name_scores.get(track_id, 0.0),
+                name,
+                score,
+            )
+            if locked:
+                self._names[track_id] = locked
+                self._name_scores[track_id] = locked_score
 
     def _raise_alarms(self, frame, plotted, person_boxes, alarm_ids: list[int]) -> None:
         from django.core.files.base import ContentFile

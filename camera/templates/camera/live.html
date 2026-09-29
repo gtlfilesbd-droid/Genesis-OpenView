@@ -2,7 +2,17 @@
 {% block title %}Live{% endblock %}
 {% block content %}
 <h1>Live</h1>
-<section id="object-classes" class="panel objects"></section>
+<section id="object-classes" class="panel objects">
+  <div class="objects-row">
+    <span class="muted">On</span>
+    <div id="enabled-objects" class="chips"></div>
+    <button type="button" id="object-picker" class="ghost">Choose</button>
+  </div>
+  <div id="object-menu" class="object-menu" hidden>
+    <input id="object-search" type="search" placeholder="Search objects" autocomplete="off">
+    <div id="object-list"></div>
+  </div>
+</section>
 <div class="layout">
   <div class="video-wrap">
     <img id="video" src="{% url 'stream' %}" alt="Live camera">
@@ -34,11 +44,14 @@ const meta = document.getElementById("meta");
 const error = document.getElementById("error");
 const detections = document.getElementById("detections");
 const banner = document.getElementById("banner");
-const objectClasses = document.getElementById("object-classes");
+const enabledObjects = document.getElementById("enabled-objects");
+const objectMenu = document.getElementById("object-menu");
+const objectSearch = document.getElementById("object-search");
+const objectList = document.getElementById("object-list");
 const csrf = document.querySelector("[name=csrfmiddlewaretoken]").value;
 let lastAlarm = 0;
 let audioReady = false;
-let chipsReady = false;
+let latestGroups = [];
 
 function beep() {
   const context = new AudioContext();
@@ -68,7 +81,9 @@ async function tick() {
   }
   meta.textContent = state + " · camera " + data.camera + " · channel " + (data.channel || "—") + " · " + data.device;
   error.textContent = data.error || "";
-  renderClasses(data.classes || []);
+  latestGroups = data.classes || [];
+  renderEnabled();
+  if (!objectMenu.hidden) renderMenu();
   detections.replaceChildren();
   for (const item of data.detections || []) {
     const row = document.createElement("tr");
@@ -95,46 +110,64 @@ async function tick() {
   }
 }
 
-function renderClasses(groups) {
-  if (!chipsReady) {
-    objectClasses.replaceChildren();
-    for (const group of groups) {
-      const section = document.createElement("div");
-      section.className = "group";
-      const heading = document.createElement("h2");
-      heading.textContent = group.name;
-      const chips = document.createElement("div");
-      chips.className = "chips";
-      for (const item of group.items) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "chip";
-        button.id = "class-" + item.id;
-        button.textContent = item.label;
-        button.addEventListener("click", () => toggleClass(item.id, button));
-        chips.append(button);
-      }
-      section.append(heading, chips);
-      objectClasses.append(section);
-    }
-    chipsReady = true;
-  }
-  for (const group of groups) {
-    for (const item of group.items) {
-      const button = document.getElementById("class-" + item.id);
-      if (button) button.classList.toggle("on", item.enabled);
-    }
+function eachClass() {
+  return latestGroups.flatMap((group) => group.items);
+}
+
+function renderEnabled() {
+  enabledObjects.replaceChildren();
+  for (const item of eachClass()) {
+    if (!item.enabled) continue;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "chip on";
+    button.textContent = item.label;
+    button.addEventListener("click", () => toggleClass(item.id));
+    enabledObjects.append(button);
   }
 }
 
-async function toggleClass(classId, button) {
-  button.classList.toggle("on");
+function renderMenu() {
+  const query = objectSearch.value.trim().toLowerCase();
+  objectList.replaceChildren();
+  for (const item of eachClass()) {
+    if (query && !item.label.toLowerCase().includes(query) && !item.name.toLowerCase().includes(query)) continue;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "menu-item" + (item.enabled ? " on" : "");
+    button.textContent = item.label;
+    button.addEventListener("click", () => toggleClass(item.id));
+    objectList.append(button);
+  }
+}
+
+async function toggleClass(classId) {
+  const item = eachClass().find((entry) => entry.id === classId);
+  if (item) item.enabled = !item.enabled;
+  renderEnabled();
+  if (!objectMenu.hidden) renderMenu();
   const body = new FormData();
   body.append("class_id", String(classId));
   body.append("csrfmiddlewaretoken", csrf);
   const response = await fetch("{% url 'objects' %}", { method: "POST", body });
-  if (!response.ok) button.classList.toggle("on");
+  if (!response.ok && item) {
+    item.enabled = !item.enabled;
+    renderEnabled();
+    if (!objectMenu.hidden) renderMenu();
+  }
 }
+
+document.getElementById("object-picker").addEventListener("click", () => {
+  objectMenu.hidden = !objectMenu.hidden;
+  if (!objectMenu.hidden) {
+    renderMenu();
+    objectSearch.focus();
+  }
+});
+objectSearch.addEventListener("input", renderMenu);
+document.addEventListener("click", (event) => {
+  if (!document.getElementById("object-classes").contains(event.target)) objectMenu.hidden = true;
+});
 
 document.addEventListener("pointerdown", () => { audioReady = true; }, { once: true });
 tick();

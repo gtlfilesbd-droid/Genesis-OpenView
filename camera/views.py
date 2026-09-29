@@ -67,7 +67,7 @@ def stream(request):
         while True:
             jpeg = engine.current_jpeg()
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-            time.sleep(0.2)
+            time.sleep(0.05)
 
     response = StreamingHttpResponse(frames(), content_type="multipart/x-mixed-replace; boundary=frame")
     response["Cache-Control"] = "no-store"
