@@ -2,3 +2,5 @@ ultralytics
 opencv-python
 Django>=6.1
 Pillow
+insightface
+onnxruntime

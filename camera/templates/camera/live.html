@@ -2,6 +2,7 @@
 {% block title %}Live{% endblock %}
 {% block content %}
 <h1>Live</h1>
+<section id="object-classes" class="panel objects"></section>
 <div class="layout">
   <div class="video-wrap">
     <img id="video" src="{% url 'stream' %}" alt="Live camera">
@@ -23,18 +24,21 @@
     <p id="meta" class="muted">Camera stopped</p>
     <p id="error" class="error"></p>
     <table>
-      <thead><tr><th>Person</th><th>In door zone</th></tr></thead>
-      <tbody id="people"></tbody>
+      <thead><tr><th>Object</th><th>Name</th><th>Confidence</th><th>Zone</th></tr></thead>
+      <tbody id="detections"></tbody>
     </table>
   </aside>
 </div>
 <script>
 const meta = document.getElementById("meta");
 const error = document.getElementById("error");
-const people = document.getElementById("people");
+const detections = document.getElementById("detections");
 const banner = document.getElementById("banner");
+const objectClasses = document.getElementById("object-classes");
+const csrf = document.querySelector("[name=csrfmiddlewaretoken]").value;
 let lastAlarm = 0;
 let audioReady = false;
+let chipsReady = false;
 
 function beep() {
   const context = new AudioContext();
@@ -64,15 +68,20 @@ async function tick() {
   }
   meta.textContent = state + " · camera " + data.camera + " · channel " + (data.channel || "—") + " · " + data.device;
   error.textContent = data.error || "";
-  people.replaceChildren();
-  for (const person of data.persons) {
+  renderClasses(data.classes || []);
+  detections.replaceChildren();
+  for (const item of data.detections || []) {
     const row = document.createElement("tr");
-    const idCell = document.createElement("td");
+    const objectCell = document.createElement("td");
+    const nameCell = document.createElement("td");
+    const confidenceCell = document.createElement("td");
     const zoneCell = document.createElement("td");
-    idCell.textContent = person.name || ("ID " + person.id);
-    zoneCell.textContent = person.inside ? person.dwell + "s" : "—";
-    row.append(idCell, zoneCell);
-    people.append(row);
+    objectCell.textContent = item.label;
+    nameCell.textContent = item.name || "—";
+    confidenceCell.textContent = Math.round(item.confidence * 100) + "%";
+    zoneCell.textContent = item.class_id === 0 && item.inside ? item.dwell + "s" : "—";
+    row.append(objectCell, nameCell, confidenceCell, zoneCell);
+    detections.append(row);
   }
   if (data.alarm && data.alarm.active) {
     banner.hidden = false;
@@ -84,6 +93,47 @@ async function tick() {
   } else {
     banner.hidden = true;
   }
+}
+
+function renderClasses(groups) {
+  if (!chipsReady) {
+    objectClasses.replaceChildren();
+    for (const group of groups) {
+      const section = document.createElement("div");
+      section.className = "group";
+      const heading = document.createElement("h2");
+      heading.textContent = group.name;
+      const chips = document.createElement("div");
+      chips.className = "chips";
+      for (const item of group.items) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "chip";
+        button.id = "class-" + item.id;
+        button.textContent = item.label;
+        button.addEventListener("click", () => toggleClass(item.id, button));
+        chips.append(button);
+      }
+      section.append(heading, chips);
+      objectClasses.append(section);
+    }
+    chipsReady = true;
+  }
+  for (const group of groups) {
+    for (const item of group.items) {
+      const button = document.getElementById("class-" + item.id);
+      if (button) button.classList.toggle("on", item.enabled);
+    }
+  }
+}
+
+async function toggleClass(classId, button) {
+  button.classList.toggle("on");
+  const body = new FormData();
+  body.append("class_id", String(classId));
+  body.append("csrfmiddlewaretoken", csrf);
+  const response = await fetch("{% url 'objects' %}", { method: "POST", body });
+  if (!response.ok) button.classList.toggle("on");
 }
 
 document.addEventListener("pointerdown", () => { audioReady = true; }, { once: true });

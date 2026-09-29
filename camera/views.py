@@ -11,12 +11,13 @@ from .models import Alarm, Person, Zone
 from .services.engine import engine, grab_jpeg
 from .services.faces import (
     MATCH_THRESHOLD,
+    current_vector,
     decode_image_bytes,
     embed_image,
-    from_bytes,
     similarity,
     to_bytes,
 )
+from .services.gallery import load_person_vector
 
 
 def _camera_number(value, default: int) -> int:
@@ -91,6 +92,16 @@ def control(request):
     return redirect("live")
 
 
+@require_POST
+def objects(request):
+    try:
+        class_id = int(request.POST.get("class_id", ""))
+    except (TypeError, ValueError):
+        return JsonResponse({"ok": False}, status=400)
+    engine.toggle_class(class_id)
+    return JsonResponse({"ok": True, "classes": engine.class_groups()})
+
+
 def zone(request):
     engine.ensure_defaults()
     camera = _camera_number(request.GET.get("camera"), engine.camera_number)
@@ -103,6 +114,10 @@ def zone(request):
         except ValueError:
             dwell = 60
         dwell = min(3600, max(1, dwell))
+        if request.POST.get("action") == "remove":
+            Zone.objects.filter(camera_number=camera).delete()
+            messages.success(request, f"Door zone removed for camera {camera}.")
+            return redirect(f"/zone/?camera={camera}&stream={stream_name}")
         points = _clean_points(request.POST.get("points"))
         if points is None:
             messages.error(request, "Click at least 3 points on the frame.")
@@ -168,7 +183,10 @@ def people(request):
                 person.save()
                 messages.success(request, f"Enrolled {name}.")
                 return redirect("people")
-    return render(request, "camera/people.html", {"people": Person.objects.order_by("-created_at")})
+    enrolled = list(Person.objects.order_by("-created_at"))
+    for person in enrolled:
+        person.needs_new_photo = load_person_vector(person) is None
+    return render(request, "camera/people.html", {"people": enrolled})
 
 
 @require_POST
@@ -195,18 +213,20 @@ def search(request):
             else:
                 people_scores = []
                 for person in Person.objects.all():
-                    if not person.embedding:
+                    stored = load_person_vector(person)
+                    if stored is None:
                         continue
-                    score = similarity(embedding, from_bytes(bytes(person.embedding)))
+                    score = similarity(embedding, stored)
                     people_scores.append(
                         {"person": person, "score": score, "match": score >= MATCH_THRESHOLD}
                     )
                 people_scores.sort(key=lambda item: item["score"], reverse=True)
                 alarm_scores = []
                 for alarm in Alarm.objects.exclude(face_embedding__isnull=True)[:200]:
-                    if not alarm.face_embedding:
+                    stored = current_vector(bytes(alarm.face_embedding) if alarm.face_embedding else None)
+                    if stored is None:
                         continue
-                    score = similarity(embedding, from_bytes(bytes(alarm.face_embedding)))
+                    score = similarity(embedding, stored)
                     if score >= MATCH_THRESHOLD:
                         alarm_scores.append({"alarm": alarm, "score": score})
                 alarm_scores.sort(key=lambda item: item["score"], reverse=True)

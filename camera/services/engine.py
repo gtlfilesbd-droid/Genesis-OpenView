@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
 from .dwell import DwellTracker
 from .geom import point_in_polygon
 from .rtsp import ROOT, base_rtsp_url, parse_channel, stream_url
@@ -47,45 +48,11 @@ def _draw_label(image, x: int, y: int, text: str, known: bool) -> None:
     )
 
 
-def _embedding_for_person(frame, coords, faces):
-    from .faces import detect_faces, embed_face, face_inside_box, largest_face
-
-    face = next((item for item in faces if face_inside_box(item, coords)), None)
-    if face is not None:
-        try:
-            return embed_face(frame, face)
-        except cv2.error:
-            return None
-    crop = _head_crop(frame, coords)
-    if crop is None:
-        return None
-    try:
-        crop_face = largest_face(detect_faces(crop))
-    except Exception:
-        return None
-    if crop_face is None:
-        return None
-    try:
-        return embed_face(crop, crop_face)
-    except cv2.error:
-        return None
-
-
-def _head_crop(frame, coords):
-    height, width = frame.shape[:2]
+def _draw_box(image, coords, text: str, known: bool) -> None:
     x1, y1, x2, y2 = [int(value) for value in coords]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(width - 1, x2), min(height - 1, y2)
-    box_height = y2 - y1
-    if box_height < 24 or x2 <= x1:
-        return None
-    head = frame[y1 : y1 + max(1, int(box_height * 0.45)), x1:x2]
-    if head.size == 0:
-        return None
-    if head.shape[0] < 160:
-        scale = 160 / head.shape[0]
-        head = cv2.resize(head, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    return head
+    color = (46, 140, 60) if known else (40, 160, 200)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    _draw_label(image, x1, y1, text, known)
 
 
 def _draw_zone(image, points) -> None:
@@ -98,18 +65,26 @@ def _draw_zone(image, points) -> None:
         cv2.polylines(image, [polygon], True, (40, 200, 240), 2)
 
 
+def _open_capture(url: str) -> cv2.VideoCapture:
+    capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
+
+
 class Engine:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._model = None
+        self._warmed = False
         self._generation = 0
         self._defaults_ready = False
         self._dwell = DwellTracker()
         self._names: dict[int, str] = {}
+        self._name_scores: dict[int, float] = {}
+        self._votes: dict[int, dict] = {}
         self._name_try_at: dict[int, float] = {}
-        self._gallery: list[tuple[str, np.ndarray]] = []
+        self._gallery: list[tuple] = []
         self._gallery_at = 0.0
         self.running = False
         self.starting = False
@@ -119,6 +94,8 @@ class Engine:
         self.device = "cpu"
         self.error = ""
         self.persons: list[dict] = []
+        self.detections: list[dict] = []
+        self.enabled_classes = set(DEFAULT_ENABLED)
         self.latest_jpeg = b""
         self.raw_jpeg = b""
         self.raw_at = 0.0
@@ -145,6 +122,8 @@ class Engine:
         stop_event = self._stop
         self._dwell = DwellTracker()
         self._names = {}
+        self._name_scores = {}
+        self._votes = {}
         self._name_try_at = {}
         with self._lock:
             self.camera_number = int(camera_number)
@@ -153,8 +132,10 @@ class Engine:
             self.running = False
             self.error = ""
             self.persons = []
+            self.detections = []
             self.latest_jpeg = b""
             self.channel = ""
+        self._warm_faces()
         self._thread = threading.Thread(
             target=self._run,
             args=(generation, stop_event),
@@ -170,8 +151,27 @@ class Engine:
             self.running = False
             self.starting = False
             self.persons = []
+            self.detections = []
             self.latest_jpeg = b""
             self.raw_jpeg = b""
+
+    def toggle_class(self, class_id: int) -> None:
+        if class_id not in COCO_NAMES:
+            return
+        with self._lock:
+            if class_id in self.enabled_classes:
+                self.enabled_classes.remove(class_id)
+            else:
+                self.enabled_classes.add(class_id)
+
+    def class_groups(self) -> list[dict]:
+        with self._lock:
+            enabled = set(self.enabled_classes)
+        return catalog(enabled)
+
+    def _enabled_ids(self) -> list[int]:
+        with self._lock:
+            return sorted(self.enabled_classes)
 
     def status(self) -> dict:
         with self._lock:
@@ -182,7 +182,7 @@ class Engine:
             elif self.last_alarm:
                 alarm = dict(self.last_alarm)
                 alarm["active"] = False
-            return {
+            snapshot = {
                 "running": self.running,
                 "starting": self.starting,
                 "camera": self.camera_number,
@@ -191,8 +191,12 @@ class Engine:
                 "device": self.device,
                 "error": self.error,
                 "persons": list(self.persons),
+                "detections": list(self.detections),
+                "enabled": set(self.enabled_classes),
                 "alarm": alarm,
             }
+        snapshot["classes"] = catalog(snapshot.pop("enabled"))
+        return snapshot
 
     def current_jpeg(self) -> bytes:
         with self._lock:
@@ -212,11 +216,20 @@ class Engine:
                 return self.raw_jpeg
         return b""
 
-    def _model_get(self):
-        if self._model is None:
-            self._model = YOLO(str(ROOT / "yolo11n.pt"))
-        self._model.predictor = None
-        return self._model
+    def _warm_faces(self) -> None:
+        if self._warmed:
+            return
+        self._warmed = True
+
+        def _load() -> None:
+            try:
+                from .faces import warm
+
+                warm()
+            except Exception as exc:
+                print("face model:", type(exc).__name__, exc)
+
+        threading.Thread(target=_load, name="face-model", daemon=True).start()
 
     def _run(self, generation: int, stop_event: threading.Event) -> None:
         from django.db import close_old_connections
@@ -227,53 +240,60 @@ class Engine:
             self._fail(generation, "Set RTSP_URL in .env")
             return
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        weight_name = "yolo11m.pt" if device == "cuda" else "yolo11s.pt"
         with self._lock:
             if generation != self._generation:
                 return
             self.channel = channel
             self.device = device
+        try:
+            model = YOLO(str(ROOT / weight_name))
+        except Exception as exc:
+            print("yolo load:", type(exc).__name__, exc)
+            self._fail(generation, "Could not load the detection model.")
+            return
         seen_frame = False
         while not stop_event.is_set() and generation == self._generation:
-            try:
-                model = self._model_get()
-                results = model.track(
-                    source=url,
-                    stream=True,
-                    persist=True,
-                    classes=[0],
-                    imgsz=640,
-                    device=device,
-                    verbose=False,
-                )
-                with self._lock:
-                    if generation == self._generation:
-                        self.running = True
-                        self.starting = False
-                        self.error = ""
-                for result in results:
-                    if stop_event.is_set() or generation != self._generation:
-                        break
-                    seen_frame = True
-                    try:
-                        self._handle_result(result, generation)
-                    except Exception as exc:
-                        print("frame error:", type(exc).__name__)
-            except Exception as exc:
-                print("camera engine error:", type(exc).__name__)
-            if stop_event.is_set() or generation != self._generation:
-                break
+            capture = _open_capture(url)
+            if not capture.isOpened():
+                capture.release()
+                self._mark_reconnect(generation, seen_frame)
+                if stop_event.wait(2):
+                    break
+                continue
             with self._lock:
                 if generation == self._generation:
-                    self.running = False
-                    self.starting = True
-                    if not seen_frame:
-                        self.error = "Could not read the camera."
-            time.sleep(2)
+                    self.running = True
+                    self.starting = False
+                    self.error = ""
+            while not stop_event.is_set() and generation == self._generation:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                seen_frame = True
+                try:
+                    self._handle_frame(model, frame, generation, device)
+                except Exception as exc:
+                    print("frame error:", type(exc).__name__)
+            capture.release()
+            if stop_event.is_set() or generation != self._generation:
+                break
+            self._mark_reconnect(generation, seen_frame)
+            if stop_event.wait(2):
+                break
         close_old_connections()
         with self._lock:
             if generation == self._generation:
                 self.running = False
                 self.starting = False
+
+    def _mark_reconnect(self, generation: int, seen_frame: bool) -> None:
+        with self._lock:
+            if generation == self._generation:
+                self.running = False
+                self.starting = True
+                if not seen_frame:
+                    self.error = "Could not read the camera."
 
     def _fail(self, generation: int, message: str) -> None:
         with self._lock:
@@ -287,54 +307,87 @@ class Engine:
 
         return Zone.objects.filter(camera_number=self.camera_number, active=True).first()
 
-    def _handle_result(self, result, generation: int) -> None:
+    def _handle_frame(self, model, frame, generation: int, device: str) -> None:
         from django.db import close_old_connections
 
         close_old_connections()
-        if generation != self._generation or result.orig_img is None:
+        if generation != self._generation:
             return
-        frame = result.orig_img.copy()
-        plotted = result.plot()
+        plotted = frame.copy()
         height, width = frame.shape[:2]
+        class_ids = self._enabled_ids()
         boxes = []
-        if result.boxes is not None and result.boxes.id is not None:
-            ids = result.boxes.id.int().tolist()
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            boxes = list(zip(ids, xyxy))
+        if class_ids:
+            results = model.track(
+                frame,
+                persist=True,
+                classes=class_ids,
+                imgsz=640,
+                conf=0.30,
+                device=device,
+                verbose=False,
+            )
+            if results:
+                boxes = _read_boxes(results[0])
 
         zone = self._load_zone()
         now = time.monotonic()
-        present: dict[int, bool] = {}
         polygon = []
         dwell_seconds = 60
         if zone and len(zone.points) >= 3:
             polygon = [(float(point[0]), float(point[1])) for point in zone.points]
             dwell_seconds = zone.dwell_seconds
             _draw_zone(plotted, polygon)
-            for track_id, coords in boxes:
+
+        present: dict[int, bool] = {}
+        person_boxes = []
+        for track_id, coords, class_id, _conf in boxes:
+            if class_id != 0 or track_id < 0:
+                continue
+            person_boxes.append((track_id, coords))
+            if polygon:
                 x1, y1, x2, y2 = coords
-                # Feet: bottom center of the person box.
                 present[track_id] = point_in_polygon((x1 + x2) / 2 / width, y2 / height, polygon)
-        else:
-            present = {track_id: False for track_id, _ in boxes}
+            else:
+                present[track_id] = False
         alarm_ids = self._dwell.update(present, now, dwell_seconds)
-        self._recognize(frame, boxes, now)
+        self._recognize(frame, person_boxes, now)
 
         persons = []
-        for track_id, coords in boxes:
-            elapsed = self._dwell.elapsed(track_id, now)
-            inside = present.get(track_id, False)
-            shown = round(elapsed, 1) if inside and elapsed is not None else 0
-            name = self._names.get(int(track_id), "")
-            persons.append({"id": int(track_id), "name": name, "dwell": shown, "inside": inside})
-            if name or (inside and elapsed is not None):
-                text = name or f"ID {int(track_id)}"
+        detections = []
+        for track_id, coords, class_id, conf in boxes:
+            label = label_for(class_id) if class_id in COCO_NAMES else "Object"
+            name = ""
+            inside = False
+            shown = 0
+            if class_id == 0 and track_id >= 0:
+                elapsed = self._dwell.elapsed(track_id, now)
+                inside = present.get(track_id, False)
+                shown = round(elapsed, 1) if inside and elapsed is not None else 0
+                name = self._names.get(int(track_id), "")
+                text = name or "Person"
                 if inside and elapsed is not None:
                     text = f"{text}  {int(elapsed)}s"
-                _draw_label(plotted, int(coords[0]), int(coords[1]), text, known=bool(name))
+                persons.append(
+                    {"id": int(track_id), "name": name, "dwell": shown, "inside": inside}
+                )
+                _draw_box(plotted, coords, text, known=bool(name))
+            else:
+                _draw_box(plotted, coords, f"{label} {round(float(conf) * 100)}%", known=False)
+            detections.append(
+                {
+                    "id": int(track_id),
+                    "class_id": int(class_id),
+                    "label": label,
+                    "name": name,
+                    "confidence": round(float(conf), 3),
+                    "dwell": shown,
+                    "inside": inside,
+                }
+            )
 
         if alarm_ids and polygon:
-            self._raise_alarms(frame, plotted, boxes, alarm_ids)
+            self._raise_alarms(frame, plotted, person_boxes, alarm_ids)
 
         ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         ok_raw, raw = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
@@ -342,110 +395,114 @@ class Engine:
             if generation != self._generation:
                 return
             self.persons = persons
+            self.detections = detections
             if ok:
                 self.latest_jpeg = encoded.tobytes()
             if ok_raw:
                 self.raw_jpeg = raw.tobytes()
                 self.raw_at = time.time()
 
-    def _enrolled(self) -> list[tuple[str, np.ndarray]]:
+    def _gallery_people(self) -> list[tuple]:
         if self._gallery_at and time.monotonic() - self._gallery_at < 5:
             return self._gallery
         from camera.models import Person
 
-        from .faces import from_bytes
+        from .gallery import load_person_vector
 
         gallery = []
         for person in Person.objects.all():
-            if not person.embedding:
+            vector = load_person_vector(person)
+            if vector is None:
                 continue
-            gallery.append((person.name, from_bytes(bytes(person.embedding))))
+            gallery.append((person, vector))
         self._gallery = gallery
         self._gallery_at = time.monotonic()
         return gallery
 
-    def _recognize(self, frame, boxes, now: float) -> None:
-        from .faces import best_name, detect_faces
+    def _recognize(self, frame, person_boxes, now: float) -> None:
+        from .faces import best_match, embed_upper_body, model_ready, next_identity
 
-        live_ids = {int(track_id) for track_id, _coords in boxes}
+        live_ids = {int(track_id) for track_id, _coords in person_boxes}
         self._names = {track_id: name for track_id, name in self._names.items() if track_id in live_ids}
-        self._name_try_at = {track_id: tried for track_id, tried in self._name_try_at.items() if track_id in live_ids}
-        gallery = self._enrolled()
+        self._name_scores = {
+            track_id: score for track_id, score in self._name_scores.items() if track_id in live_ids
+        }
+        self._votes = {track_id: votes for track_id, votes in self._votes.items() if track_id in live_ids}
+        self._name_try_at = {
+            track_id: tried for track_id, tried in self._name_try_at.items() if track_id in live_ids
+        }
+        if not model_ready():
+            return
+        gallery = [(person.name, vector) for person, vector in self._gallery_people()]
         if not gallery:
             return
-        pending = [
-            (int(track_id), coords)
-            for track_id, coords in boxes
-            if int(track_id) not in self._names and now - self._name_try_at.get(int(track_id), 0) >= 2
-        ][:1]
+        pending = []
+        for track_id, coords in person_boxes:
+            track_id = int(track_id)
+            wait = 4.0 if track_id in self._names else 1.5
+            if now - self._name_try_at.get(track_id, 0) >= wait:
+                pending.append((track_id, coords))
         if not pending:
             return
+        pending.sort(key=lambda item: self._name_try_at.get(item[0], 0))
+        track_id, coords = pending[0]
+        self._name_try_at[track_id] = now
         try:
-            faces = list(detect_faces(frame))
+            found = embed_upper_body(frame, coords)
         except Exception:
-            faces = []
-        for track_id, coords in pending:
-            self._name_try_at[track_id] = now
-            embedding = _embedding_for_person(frame, coords, faces)
-            if embedding is None:
-                continue
-            name = best_name(embedding, gallery)
-            if name:
-                self._names[track_id] = name
+            return
+        if found is None:
+            return
+        embedding, _face_box = found
+        name, score = best_match(embedding, gallery)
+        if not name:
+            return
+        votes = self._votes.setdefault(track_id, {})
+        locked, locked_score = next_identity(
+            votes,
+            self._names.get(track_id, ""),
+            self._name_scores.get(track_id, 0.0),
+            name,
+            score,
+        )
+        if locked:
+            self._names[track_id] = locked
+            self._name_scores[track_id] = locked_score
 
-    def _raise_alarms(self, frame, plotted, boxes, alarm_ids: list[int]) -> None:
+    def _raise_alarms(self, frame, plotted, person_boxes, alarm_ids: list[int]) -> None:
         from django.core.files.base import ContentFile
         from django.utils import timezone
 
-        from camera.models import Alarm, Person
+        from camera.models import Alarm
 
-        from .faces import (
-            MATCH_THRESHOLD,
-            detect_faces,
-            embed_face,
-            face_inside_box,
-            from_bytes,
-            similarity,
-            to_bytes,
-        )
+        from .faces import best_match, embed_upper_body, model_ready, to_bytes
 
-        try:
-            faces = detect_faces(frame)
-        except Exception:
-            faces = []
-        people = list(Person.objects.all())
-        located = {track_id: coords for track_id, coords in boxes}
+        if not model_ready():
+            faces_ready = False
+        else:
+            faces_ready = True
+        people = self._gallery_people()
+        located = {int(track_id): coords for track_id, coords in person_boxes}
         for track_id in alarm_ids:
-            coords = located.get(track_id)
-            face = None
-            if coords is not None:
-                for candidate in faces:
-                    if face_inside_box(candidate, coords):
-                        face = candidate
-                        break
+            coords = located.get(int(track_id))
             embedding = None
-            if face is not None:
+            face_box = None
+            if faces_ready and coords is not None:
                 try:
-                    embedding = embed_face(frame, face)
-                except cv2.error:
-                    embedding = None
+                    found = embed_upper_body(frame, coords)
+                except Exception:
+                    found = None
+                if found is not None:
+                    embedding, face_box = found
             matched = None
             score = None
             name = "Unknown"
             if embedding is not None and people:
-                best = -1.0
-                best_person = None
-                for person in people:
-                    if not person.embedding:
-                        continue
-                    value = similarity(embedding, from_bytes(bytes(person.embedding)))
-                    if value > best:
-                        best = value
-                        best_person = person
-                score = best if best >= 0 else None
-                if best_person is not None and best >= MATCH_THRESHOLD:
-                    matched = best_person
-                    name = best_person.name
+                chosen, best = best_match(embedding, [(person.name, vector) for person, vector in people])
+                score = best
+                if chosen:
+                    name = chosen
+                    matched = next((person for person, _vector in people if person.name == chosen), None)
 
             ok, jpeg = cv2.imencode(".jpg", plotted)
             if not ok:
@@ -463,12 +520,10 @@ class Engine:
                 ContentFile(jpeg.tobytes()),
                 save=False,
             )
-            if embedding is not None and face is not None:
+            if embedding is not None and face_box is not None:
                 alarm.face_embedding = to_bytes(embedding)
-                x, y, box_w, box_h = [int(value) for value in face[:4]]
-                y1 = max(0, y)
-                x1 = max(0, x)
-                crop = frame[y1 : y1 + box_h, x1 : x1 + box_w]
+                x1, y1, x2, y2 = face_box
+                crop = frame[y1:y2, x1:x2]
                 if crop.size:
                     ok_crop, crop_jpeg = cv2.imencode(".jpg", crop)
                     if ok_crop:
@@ -487,6 +542,20 @@ class Engine:
                     "at": time.time(),
                     "active": True,
                 }
+
+
+def _read_boxes(result) -> list[tuple]:
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    clss = boxes.cls.cpu().numpy().astype(int)
+    if boxes.id is not None:
+        ids = boxes.id.int().cpu().tolist()
+    else:
+        ids = [-index - 1 for index in range(len(xyxy))]
+    return list(zip(ids, xyxy, clss, confs))
 
 
 engine = Engine()

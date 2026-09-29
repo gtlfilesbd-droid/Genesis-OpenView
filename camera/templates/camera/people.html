@@ -13,6 +13,7 @@
     <article class="panel">
       <img src="{{ person.photo.url }}" alt="{{ person.name }}">
       <p><strong>{{ person.name }}</strong></p>
+      {% if person.needs_new_photo %}<p class="error">Needs a new front-facing photo.</p>{% endif %}
       <form method="post" action="{% url 'person_delete' person.pk %}">
         {% csrf_token %}
         <button class="ghost" type="submit">Remove</button>
