@@ -1,0 +1,80 @@
+{% extends "camera/base.html" %}
+{% block title %}Door zone{% endblock %}
+{% block content %}
+<h1>Door zone</h1>
+<p class="muted">Click the doorway corners. A person is inside when their feet, the bottom center of the box, are in the shape. Default wait is 60 seconds.</p>
+<form method="get" class="row">
+  <label>Camera number
+    <input type="number" name="camera" min="1" value="{{ camera }}" required>
+  </label>
+  <label><input type="radio" name="stream" value="sub" {% if stream == "sub" %}checked{% endif %}> Sub</label>
+  <label><input type="radio" name="stream" value="main" {% if stream == "main" %}checked{% endif %}> Main</label>
+  <button type="submit">Load frame</button>
+</form>
+<div class="stage" id="stage">
+  <img id="frame" src="{% url 'zone_frame' %}?camera={{ camera }}&stream={{ stream }}" alt="Frame for the door zone">
+  <canvas id="draw"></canvas>
+</div>
+<form method="post">
+  {% csrf_token %}
+  <input type="hidden" name="camera" value="{{ camera }}">
+  <input type="hidden" name="stream" value="{{ stream }}">
+  <input type="hidden" name="points" id="points">
+  <label>Seconds in the zone before alarm
+    <input type="number" name="dwell_seconds" min="1" max="3600" value="{{ dwell_seconds }}">
+  </label>
+  <div class="row">
+    <button type="submit">Save zone</button>
+    <button type="button" class="ghost" id="undo">Undo point</button>
+    <button type="button" class="ghost" id="clear">Clear</button>
+  </div>
+  <p id="count" class="muted"></p>
+</form>
+{{ points|json_script:"zone-data" }}
+<script>
+const img = document.getElementById("frame");
+const canvas = document.getElementById("draw");
+const ctx = canvas.getContext("2d");
+const pointsInput = document.getElementById("points");
+const count = document.getElementById("count");
+let points = JSON.parse(document.getElementById("zone-data").textContent || "[]");
+
+function sync() {
+  pointsInput.value = JSON.stringify(points);
+  count.textContent = points.length + " point" + (points.length === 1 ? "" : "s");
+}
+
+function draw() {
+  canvas.width = img.clientWidth;
+  canvas.height = img.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!points.length) return;
+  ctx.strokeStyle = "#d7a441";
+  ctx.fillStyle = "#d7a441";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((point, index) => {
+    const x = point[0] * canvas.width;
+    const y = point[1] * canvas.height;
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+    ctx.fillRect(x - 3, y - 3, 6, 6);
+  });
+  if (points.length > 2) ctx.closePath();
+  ctx.stroke();
+}
+
+canvas.addEventListener("click", (event) => {
+  const rect = canvas.getBoundingClientRect();
+  points.push([(event.clientX - rect.left) / rect.width, (event.clientY - rect.top) / rect.height]);
+  sync();
+  draw();
+});
+document.getElementById("undo").addEventListener("click", () => { points.pop(); sync(); draw(); });
+document.getElementById("clear").addEventListener("click", () => { points = []; sync(); draw(); });
+img.addEventListener("load", () => { sync(); draw(); });
+window.addEventListener("resize", draw);
+sync();
+if (img.complete) draw();
+</script>
+{% endblock %}

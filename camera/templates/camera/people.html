@@ -1,0 +1,25 @@
+{% extends "camera/base.html" %}
+{% block title %}People{% endblock %}
+{% block content %}
+<h1>People</h1>
+<form method="post" enctype="multipart/form-data" class="panel">
+  {% csrf_token %}
+  <label>Name <input name="name" required></label>
+  <label>Front-facing photo <input type="file" name="photo" accept="image/*" required></label>
+  <button type="submit">Enroll</button>
+</form>
+<div class="cards" style="margin-top: 16px;">
+  {% for person in people %}
+    <article class="panel">
+      <img src="{{ person.photo.url }}" alt="{{ person.name }}">
+      <p><strong>{{ person.name }}</strong></p>
+      <form method="post" action="{% url 'person_delete' person.pk %}">
+        {% csrf_token %}
+        <button class="ghost" type="submit">Remove</button>
+      </form>
+    </article>
+  {% empty %}
+    <p class="muted">No enrolled people yet.</p>
+  {% endfor %}
+</div>
+{% endblock %}

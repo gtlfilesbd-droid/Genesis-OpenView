@@ -1,0 +1,9 @@
+.venv/
+.env
+runs/
+*.pt
+db.sqlite3
+media/
+models/*.onnx
+__pycache__/
+*.pyc

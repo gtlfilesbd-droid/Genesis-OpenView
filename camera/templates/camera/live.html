@@ -1,0 +1,93 @@
+{% extends "camera/base.html" %}
+{% block title %}Live{% endblock %}
+{% block content %}
+<h1>Live</h1>
+<div class="layout">
+  <div class="video-wrap">
+    <img id="video" src="{% url 'stream' %}" alt="Live camera">
+    <div id="banner" class="banner" hidden></div>
+  </div>
+  <aside class="panel">
+    <form method="post" action="{% url 'control' %}">
+      {% csrf_token %}
+      <label>Camera number
+        <input type="number" name="camera" min="1" value="{{ camera }}" required>
+      </label>
+      <label><input type="radio" name="stream" value="sub" {% if stream == "sub" %}checked{% endif %}> Sub stream</label>
+      <label><input type="radio" name="stream" value="main" {% if stream == "main" %}checked{% endif %}> Main stream</label>
+      <div class="row">
+        <button name="action" value="start">Start</button>
+        <button class="ghost" name="action" value="stop">Stop</button>
+      </div>
+    </form>
+    <p id="meta" class="muted">Camera stopped</p>
+    <p id="error" class="error"></p>
+    <table>
+      <thead><tr><th>Person</th><th>In door zone</th></tr></thead>
+      <tbody id="people"></tbody>
+    </table>
+  </aside>
+</div>
+<script>
+const meta = document.getElementById("meta");
+const error = document.getElementById("error");
+const people = document.getElementById("people");
+const banner = document.getElementById("banner");
+let lastAlarm = 0;
+let audioReady = false;
+
+function beep() {
+  const context = new AudioContext();
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  oscillator.frequency.value = 880;
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  gain.gain.setValueAtTime(0.08, context.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.35);
+  oscillator.start();
+  oscillator.stop(context.currentTime + 0.35);
+}
+
+async function tick() {
+  const response = await fetch("{% url 'status' %}");
+  const data = await response.json();
+  const state = data.running ? "Live" : (data.starting ? "Reconnecting" : "Stopped");
+  if (data.running) {
+    const video = document.getElementById("video");
+    if (video.dataset.live !== "1") {
+      video.dataset.live = "1";
+      video.src = "{% url 'stream' %}?t=" + Date.now();
+    }
+  } else if (!data.starting) {
+    document.getElementById("video").dataset.live = "0";
+  }
+  meta.textContent = state + " · camera " + data.camera + " · channel " + (data.channel || "—") + " · " + data.device;
+  error.textContent = data.error || "";
+  people.replaceChildren();
+  for (const person of data.persons) {
+    const row = document.createElement("tr");
+    const idCell = document.createElement("td");
+    const zoneCell = document.createElement("td");
+    idCell.textContent = person.name || ("ID " + person.id);
+    zoneCell.textContent = person.inside ? person.dwell + "s" : "—";
+    row.append(idCell, zoneCell);
+    people.append(row);
+  }
+  if (data.alarm && data.alarm.active) {
+    banner.hidden = false;
+    banner.textContent = "Alarm · person " + data.alarm.track_id + " · " + data.alarm.name;
+    if (data.alarm.id !== lastAlarm) {
+      lastAlarm = data.alarm.id;
+      if (audioReady) beep();
+    }
+  } else {
+    banner.hidden = true;
+  }
+}
+
+document.addEventListener("pointerdown", () => { audioReady = true; }, { once: true });
+tick();
+setInterval(tick, 1000);
+</script>
+{% endblock %}

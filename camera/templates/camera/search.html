@@ -1,0 +1,41 @@
+{% extends "camera/base.html" %}
+{% block title %}Search{% endblock %}
+{% block content %}
+<h1>Search by photo</h1>
+<form method="post" enctype="multipart/form-data" class="panel">
+  {% csrf_token %}
+  <label>Photo <input type="file" name="photo" accept="image/*" required></label>
+  <button type="submit">Search</button>
+</form>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if found %}
+  <h2>Enrolled people</h2>
+  {% if not found.people %}
+    <p class="muted">Nobody is enrolled yet.</p>
+  {% else %}
+    <div class="cards">
+      {% for item in found.people %}
+        <article class="panel">
+          <img src="{{ item.person.photo.url }}" alt="{{ item.person.name }}">
+          <p><strong>{{ item.person.name }}</strong></p>
+          <p class="{% if item.match %}ok{% else %}muted{% endif %}">Score {{ item.score|floatformat:3 }}{% if item.match %} · match{% endif %}</p>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+  <h2>Past alarms</h2>
+  {% if not found.alarms %}
+    <p class="muted">No alarm face matched this photo.</p>
+  {% else %}
+    <div class="cards">
+      {% for item in found.alarms %}
+        <article class="panel">
+          <img class="shot" src="{{ item.alarm.snapshot.url }}" alt="Matching alarm">
+          <p>{{ item.alarm.matched_name }} · score {{ item.score|floatformat:3 }}</p>
+          <p class="muted">Camera {{ item.alarm.camera_number }} · {{ item.alarm.created_at|date:"Y-m-d H:i:s" }}</p>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}
