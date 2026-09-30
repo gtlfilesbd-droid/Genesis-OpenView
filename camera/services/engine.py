@@ -22,13 +22,29 @@ def _placeholder(text: str) -> bytes:
     return encoded.tobytes() if ok else b""
 
 
-def _draw_label(image, x: int, y: int, text: str, known: bool) -> None:
+def _kind_name(kind) -> str:
+    if kind is True:
+        return "whitelist"
+    if kind is False or kind is None:
+        return ""
+    return str(kind)
+
+
+def _box_color(kind: str) -> tuple[int, int, int]:
+    if kind == "blacklist":
+        return (48, 48, 220)
+    if kind == "whitelist":
+        return (46, 140, 60)
+    return (40, 160, 200)
+
+
+def _draw_label(image, x: int, y: int, text: str, kind: str) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.6
     thickness = 2
     (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
     top = max(0, y - text_height - 10)
-    color = (46, 140, 60) if known else (40, 160, 200)
+    color = _box_color(kind)
     cv2.rectangle(
         image,
         (x, top),
@@ -48,11 +64,12 @@ def _draw_label(image, x: int, y: int, text: str, known: bool) -> None:
     )
 
 
-def _draw_box(image, coords, text: str, known: bool) -> None:
+def _draw_box(image, coords, text: str, kind="") -> None:
+    kind = _kind_name(kind)
     x1, y1, x2, y2 = [int(value) for value in coords]
-    color = (46, 140, 60) if known else (40, 160, 200)
+    color = _box_color(kind)
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    _draw_label(image, x1, y1, text, known)
+    _draw_label(image, x1, y1, text, kind)
 
 
 def _draw_zone(image, points) -> None:
@@ -82,8 +99,12 @@ class Engine:
         self._dwell = DwellTracker()
         self._names: dict[int, str] = {}
         self._name_scores: dict[int, float] = {}
+        self._kinds: dict[int, str] = {}
+        self._person_ids: dict[int, int] = {}
         self._votes: dict[int, dict] = {}
         self._name_try_at: dict[int, float] = {}
+        self._capture_ids: dict[int, int] = {}
+        self._alarmed_tracks: set[int] = set()
         self._gallery: list[tuple] = []
         self._gallery_at = 0.0
         self.running = False
@@ -130,8 +151,12 @@ class Engine:
         self._dwell = DwellTracker()
         self._names = {}
         self._name_scores = {}
+        self._kinds = {}
+        self._person_ids = {}
         self._votes = {}
         self._name_try_at = {}
+        self._capture_ids = {}
+        self._alarmed_tracks = set()
         self._last_draw = []
         self._last_polygon = []
         self._zone_at = 0.0
@@ -399,9 +424,11 @@ class Engine:
         draw: list[tuple] = []
         with self._lock:
             names = dict(self._names)
+            kinds = dict(self._kinds)
         for track_id, coords, class_id, conf in boxes:
             label = label_for(class_id) if class_id in COCO_NAMES else "Object"
             name = ""
+            kind = ""
             inside = False
             shown = 0
             if class_id == 0 and track_id >= 0:
@@ -409,24 +436,26 @@ class Engine:
                 inside = present.get(track_id, False)
                 shown = round(elapsed, 1) if inside and elapsed is not None else 0
                 name = names.get(int(track_id), "")
-                text = name or "Person"
+                kind = kinds.get(int(track_id), "")
+                text = f"{name} · {kind}" if name and kind else (name or "Person")
                 if inside and elapsed is not None:
                     text = f"{text}  {int(elapsed)}s"
                 persons.append(
-                    {"id": int(track_id), "name": name, "dwell": shown, "inside": inside}
+                    {"id": int(track_id), "name": name, "list": kind, "dwell": shown, "inside": inside}
                 )
-                _draw_box(plotted, coords, text, known=bool(name))
-                draw.append((coords, text, bool(name)))
+                _draw_box(plotted, coords, text, kind)
+                draw.append((coords, text, kind))
             else:
                 text = f"{label} {round(float(conf) * 100)}%"
-                _draw_box(plotted, coords, text, known=False)
-                draw.append((coords, text, False))
+                _draw_box(plotted, coords, text, "")
+                draw.append((coords, text, ""))
             detections.append(
                 {
                     "id": int(track_id),
                     "class_id": int(class_id),
                     "label": label,
                     "name": name,
+                    "list": kind,
                     "confidence": round(float(conf), 3),
                     "dwell": shown,
                     "inside": inside,
@@ -480,10 +509,22 @@ class Engine:
             self._name_scores = {
                 track_id: score for track_id, score in self._name_scores.items() if track_id in live_ids
             }
+            self._kinds = {track_id: kind for track_id, kind in self._kinds.items() if track_id in live_ids}
+            self._person_ids = {
+                track_id: person_id
+                for track_id, person_id in self._person_ids.items()
+                if track_id in live_ids
+            }
             self._votes = {track_id: votes for track_id, votes in self._votes.items() if track_id in live_ids}
             self._name_try_at = {
                 track_id: tried for track_id, tried in self._name_try_at.items() if track_id in live_ids
             }
+            self._capture_ids = {
+                track_id: capture_id
+                for track_id, capture_id in self._capture_ids.items()
+                if track_id in live_ids
+            }
+            self._alarmed_tracks = {track_id for track_id in self._alarmed_tracks if track_id in live_ids}
             pending = []
             for track_id, coords in person_boxes:
                 track_id = int(track_id)
@@ -516,35 +557,123 @@ class Engine:
             if generation != self._generation:
                 continue
             try:
+                from django.db import close_old_connections
+
+                close_old_connections()
                 self._match_face(frame, track_id, coords)
             except Exception:
                 print("face match error")
 
     def _match_face(self, frame, track_id: int, coords) -> None:
-        from .faces import best_match, embed_upper_body, next_identity
+        from .captures import save_visit
+        from .faces import (
+            _crop_box,
+            _padded_box,
+            best_person,
+            blacklist_alarm_ready,
+            embed_upper_body,
+            next_identity,
+        )
 
-        gallery = [(person.name, vector) for person, vector in self._gallery_people()]
-        if not gallery:
-            return
         found = embed_upper_body(frame, coords)
-        if found is None:
+        if found is None or not (found.label_ok or found.save_ok):
             return
-        embedding, _face_box = found
-        name, score = best_match(embedding, gallery)
-        if not name:
-            return
+        people = self._gallery_people()
+        name = ""
+        score = 0.0
+        if found.label_ok and people:
+            matched, score = best_person(found.embedding, people)
+            if matched is not None:
+                name = matched.name
         with self._lock:
-            votes = self._votes.setdefault(track_id, {})
-            locked, locked_score = next_identity(
-                votes,
-                self._names.get(track_id, ""),
-                self._name_scores.get(track_id, 0.0),
-                name,
-                score,
+            if name:
+                votes = self._votes.setdefault(track_id, {})
+                locked, locked_score = next_identity(
+                    votes,
+                    self._names.get(track_id, ""),
+                    self._name_scores.get(track_id, 0.0),
+                    name,
+                    score,
+                )
+                if locked:
+                    chosen = next((person for person, _vector in people if person.name == locked), None)
+                    if chosen is not None:
+                        self._names[track_id] = locked
+                        self._name_scores[track_id] = locked_score
+                        self._kinds[track_id] = chosen.list_status
+                        self._person_ids[track_id] = chosen.pk
+            locked_name = self._names.get(track_id, "")
+            locked_score = self._name_scores.get(track_id, 0.0)
+            kind = self._kinds.get(track_id, "")
+            person_id = self._person_ids.get(track_id)
+            known_capture = self._capture_ids.get(track_id)
+            already_alarmed = track_id in self._alarmed_tracks
+        person = next((item for item, _vector in people if item.pk == person_id), None)
+        if found.save_ok:
+            crop = _crop_box(frame, _padded_box(found.box, frame.shape))
+            capture_id = save_visit(
+                self.camera_number,
+                track_id,
+                found.embedding,
+                crop,
+                found.det_score,
+                found.quality,
+                person if locked_name else None,
+                locked_name,
+                locked_score if locked_name else None,
+                known_capture,
             )
-            if locked:
-                self._names[track_id] = locked
-                self._name_scores[track_id] = locked_score
+            if capture_id:
+                with self._lock:
+                    self._capture_ids[track_id] = capture_id
+        if blacklist_alarm_ready(kind, locked_score) and not already_alarmed and person is not None:
+            if self._raise_list_alarm(frame, track_id, coords, person, locked_score, found):
+                with self._lock:
+                    self._alarmed_tracks.add(track_id)
+
+    def _raise_list_alarm(self, frame, track_id: int, coords, person, score: float, found) -> bool:
+        from django.core.files.base import ContentFile
+        from django.utils import timezone
+
+        from camera.models import Alarm
+
+        from .faces import _crop_box, _padded_box, to_bytes
+
+        plotted = frame.copy()
+        _draw_box(plotted, coords, f"{person.name} · blacklist", "blacklist")
+        ok, jpeg = cv2.imencode(".jpg", plotted)
+        if not ok:
+            return False
+        alarm = Alarm(
+            camera_number=self.camera_number,
+            track_id=int(track_id),
+            person=person,
+            matched_name=person.name,
+            score=score,
+        )
+        stamp = timezone.now().strftime("%Y%m%d-%H%M%S")
+        alarm.snapshot.save(f"{stamp}-{int(track_id)}-list.jpg", ContentFile(jpeg.tobytes()), save=False)
+        alarm.face_embedding = to_bytes(found.embedding)
+        crop = _crop_box(frame, _padded_box(found.box, frame.shape))
+        if crop.size:
+            ok_crop, crop_jpeg = cv2.imencode(".jpg", crop)
+            if ok_crop:
+                alarm.face_crop.save(
+                    f"{stamp}-{int(track_id)}-list-face.jpg",
+                    ContentFile(crop_jpeg.tobytes()),
+                    save=False,
+                )
+        alarm.save()
+        with self._lock:
+            self.last_alarm = {
+                "id": alarm.id,
+                "name": person.name,
+                "track_id": int(track_id),
+                "camera": self.camera_number,
+                "at": time.time(),
+                "active": True,
+            }
+        return True
 
     def _raise_alarms(self, frame, plotted, person_boxes, alarm_ids: list[int]) -> None:
         from django.core.files.base import ContentFile
@@ -570,7 +699,7 @@ class Engine:
                 except Exception:
                     found = None
                 if found is not None:
-                    embedding, face_box = found
+                    embedding, face_box = found.embedding, found.box
             matched = None
             score = None
             name = "Unknown"

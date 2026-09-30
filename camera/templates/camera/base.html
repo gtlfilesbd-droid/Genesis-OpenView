@@ -106,6 +106,16 @@
       border-radius: 8px;
       font-weight: 650;
     }
+    button.danger { background: var(--alarm); color: white; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+    }
+    .badge.whitelist { background: #1c3d2a; color: #b7ebc9; }
+    .badge.blacklist { background: #3a2020; color: #ffb4b4; }
+    .badge.unknown { background: #2a3140; color: #c5d0dc; }
     .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
     .cards img, .shot { width: 100%; border-radius: 8px; background: #000; }
     .stage { position: relative; display: inline-block; max-width: 100%; }
@@ -126,6 +136,7 @@
       <a href="{% url 'live' %}" {% if request.resolver_match.url_name == 'live' %}class="active"{% endif %}>Live</a>
       <a href="{% url 'zone' %}" {% if request.resolver_match.url_name == 'zone' %}class="active"{% endif %}>Zone</a>
       <a href="{% url 'alarms' %}" {% if request.resolver_match.url_name == 'alarms' %}class="active"{% endif %}>Alarms</a>
+      <a href="{% url 'recognition' %}" {% if request.resolver_match.url_name == 'recognition' %}class="active"{% endif %}>Recognition</a>
       <a href="{% url 'people' %}" {% if request.resolver_match.url_name == 'people' %}class="active"{% endif %}>People</a>
       <a href="{% url 'search' %}" {% if request.resolver_match.url_name == 'search' %}class="active"{% endif %}>Search</a>
     </nav>

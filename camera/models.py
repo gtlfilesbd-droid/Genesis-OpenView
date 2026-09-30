@@ -13,9 +13,13 @@ class Zone(models.Model):
 
 
 class Person(models.Model):
+    WHITELIST = "whitelist"
+    BLACKLIST = "blacklist"
+
     name = models.CharField(max_length=120)
     photo = models.ImageField(upload_to="people/")
     embedding = models.BinaryField()
+    list_status = models.CharField(max_length=16, default=WHITELIST)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self) -> str:
@@ -38,3 +42,22 @@ class Alarm(models.Model):
 
     def __str__(self) -> str:
         return f"Camera {self.camera_number} track {self.track_id}"
+
+
+class FaceCapture(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    camera_number = models.PositiveIntegerField()
+    track_id = models.IntegerField()
+    face_crop = models.ImageField(upload_to="captures/")
+    embedding = models.BinaryField()
+    det_score = models.FloatField(default=0)
+    quality = models.FloatField(default=0)
+    match_score = models.FloatField(null=True, blank=True)
+    matched_name = models.CharField(max_length=120, blank=True, default="")
+    person = models.ForeignKey(Person, null=True, blank=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Camera {self.camera_number} {self.matched_name or 'Unknown'}"

@@ -129,3 +129,147 @@ class ZoneGeometryTests(TestCase):
             self.assertIn("/Streaming/Channels/1201", main_url)
         finally:
             rtsp.base_rtsp_url = original
+
+
+class FaceQualityTests(TestCase):
+    def test_flat_frame_is_blurrier_than_a_sharp_pattern(self):
+        import numpy as np
+
+        from camera.services.faces import MIN_BLUR, blur_score
+
+        flat = np.full((90, 90), 128, dtype=np.uint8)
+        sharp = np.zeros((90, 90), dtype=np.uint8)
+        sharp[::2, ::2] = 255
+        self.assertLess(blur_score(flat), blur_score(sharp))
+        self.assertLess(blur_score(flat), MIN_BLUR)
+
+    def test_save_requires_a_large_sharp_front_face(self):
+        from camera.services.faces import assess_face
+
+        label_ok, save_ok, quality = assess_face(0.9, 100, 120, 5)
+        self.assertTrue(label_ok)
+        self.assertTrue(save_ok)
+        self.assertGreater(quality, 0)
+        self.assertFalse(assess_face(0.4, 100, 120, 0)[0])
+        self.assertFalse(assess_face(0.9, 30, 120, 0)[0])
+        self.assertTrue(assess_face(0.9, 100, 10, 0)[0])
+        self.assertFalse(assess_face(0.9, 100, 10, 0)[1])
+        self.assertFalse(assess_face(0.9, 100, 120, 45)[1])
+
+    def test_blacklist_alarm_needs_a_stronger_score(self):
+        from camera.services.faces import blacklist_alarm_ready
+
+        self.assertFalse(blacklist_alarm_ready("blacklist", 0.48))
+        self.assertTrue(blacklist_alarm_ready("blacklist", 0.52))
+        self.assertFalse(blacklist_alarm_ready("whitelist", 0.9))
+
+    def test_close_people_are_not_chosen(self):
+        import numpy as np
+
+        from camera.services.faces import best_person
+
+        ashraf = np.zeros(512, dtype=np.float32)
+        ashraf[0] = 1
+        sharif = np.zeros(512, dtype=np.float32)
+        sharif[0] = 0.98
+        sharif[1] = 0.199
+        sharif /= np.linalg.norm(sharif)
+        chosen, _score = best_person(ashraf, [("Ashraf", ashraf), ("Sharif", sharif)])
+        self.assertIsNone(chosen)
+        other = np.zeros(512, dtype=np.float32)
+        other[1] = 1
+        chosen, score = best_person(ashraf, [("Ashraf", ashraf), ("Other", other)])
+        self.assertEqual(chosen, "Ashraf")
+        self.assertGreater(score, 0.9)
+
+    def test_stamp_adds_a_time_bar(self):
+        import numpy as np
+
+        from camera.services.captures import stamp_face
+
+        crop = np.zeros((40, 50, 3), dtype=np.uint8)
+        stamped = stamp_face(crop)
+        self.assertGreater(stamped.shape[0], crop.shape[0])
+        self.assertGreaterEqual(stamped.shape[1], crop.shape[1])
+
+
+class FaceCaptureTests(TestCase):
+    def _vector(self, index: int):
+        import numpy as np
+
+        vector = np.zeros(512, dtype=np.float32)
+        vector[index] = 1
+        return vector
+
+    def _crop(self):
+        import numpy as np
+
+        image = np.zeros((80, 96, 3), dtype=np.uint8)
+        image[:, :] = (40, 90, 140)
+        return image
+
+    def test_similar_face_updates_the_same_card(self):
+        from camera.models import FaceCapture
+        from camera.services.captures import save_visit
+
+        first = save_visit(1, 4, self._vector(0), self._crop(), 0.8, 1.0, None, "", None, None)
+        second = save_visit(1, 9, self._vector(0), self._crop(), 0.9, 1.4, None, "", None, None)
+        self.assertEqual(first, second)
+        self.assertEqual(FaceCapture.objects.count(), 1)
+        saved = FaceCapture.objects.get()
+        self.assertGreater(saved.quality, 1.2)
+        self.assertEqual(saved.camera_number, 1)
+
+    def test_different_face_is_a_new_card(self):
+        from camera.models import FaceCapture
+        from camera.services.captures import save_visit
+
+        save_visit(1, 4, self._vector(0), self._crop(), 0.8, 1.0, None, "", None, None)
+        save_visit(1, 5, self._vector(3), self._crop(), 0.8, 1.0, None, "", None, None)
+        self.assertEqual(FaceCapture.objects.count(), 2)
+
+    def test_classify_puts_the_face_on_a_list(self):
+        import cv2
+        import numpy as np
+        from django.core.files.base import ContentFile
+
+        from camera.models import FaceCapture, Person
+        from camera.services.faces import to_bytes
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        vector = self._vector(0)
+        capture = FaceCapture(
+            camera_number=2,
+            track_id=8,
+            embedding=to_bytes(vector),
+            det_score=0.9,
+            quality=1.1,
+        )
+        capture.face_crop.save("face.jpg", ContentFile(encoded.tobytes()), save=True)
+        twin = FaceCapture(
+            camera_number=2,
+            track_id=9,
+            embedding=to_bytes(vector),
+            det_score=0.88,
+            quality=1.0,
+        )
+        twin.face_crop.save("twin.jpg", ContentFile(encoded.tobytes()), save=True)
+        response = self.client.post(
+            f"/recognition/{capture.pk}/list/",
+            {"name": "Ashraf", "list_status": "blacklist"},
+        )
+        self.assertEqual(response.status_code, 302)
+        person = Person.objects.get()
+        self.assertEqual(person.name, "Ashraf")
+        self.assertEqual(person.list_status, Person.BLACKLIST)
+        capture.refresh_from_db()
+        twin.refresh_from_db()
+        self.assertEqual(capture.person_id, person.pk)
+        self.assertEqual(twin.person_id, person.pk)
+        self.assertEqual(twin.matched_name, "Ashraf")
+        page = self.client.get("/recognition/")
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "Ashraf")
+        self.assertContains(page, "blacklist")

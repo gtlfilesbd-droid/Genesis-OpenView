@@ -1,4 +1,5 @@
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -10,6 +11,16 @@ EMBED_DIM = 512
 MATCH_THRESHOLD = 0.45
 MATCH_MARGIN = 0.08
 MIN_DET_SCORE = 0.5
+# Live labels can use a slightly softer face. Saving a capture is stricter.
+LABEL_DET_SCORE = 0.55
+LABEL_MIN_WIDTH = 48
+LABEL_MAX_YAW = 40.0
+SAVE_DET_SCORE = 0.62
+SAVE_MIN_WIDTH = 64
+SAVE_MAX_YAW = 30.0
+MIN_BLUR = 45.0
+BLACKLIST_THRESHOLD = 0.52
+DEDUP_SIMILARITY = 0.55
 
 _app = None
 _init_lock = threading.Lock()
@@ -53,6 +64,68 @@ def _vector(face) -> np.ndarray:
     return np.asarray(face.normed_embedding, dtype=np.float32).reshape(-1)
 
 
+def blur_score(image: np.ndarray) -> float:
+    """Higher means a sharper crop. Flat frames score near zero."""
+    if image is None or image.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def face_yaw(face) -> float | None:
+    pose = getattr(face, "pose", None)
+    if pose is None:
+        return None
+    values = np.asarray(pose, dtype=np.float32).reshape(-1)
+    if values.size < 2:
+        return None
+    return float(values[1])
+
+
+def assess_face(det_score: float, face_width: int, blur: float, yaw: float | None) -> tuple[bool, bool, float]:
+    """Return (label_ok, save_ok, quality). save_ok is the bar for a recognition card."""
+    yaw_abs = abs(float(yaw)) if yaw is not None else 0.0
+    yaw_known = yaw is not None
+    label_ok = (
+        float(det_score) >= LABEL_DET_SCORE
+        and int(face_width) >= LABEL_MIN_WIDTH
+        and (not yaw_known or yaw_abs <= LABEL_MAX_YAW)
+    )
+    save_ok = (
+        label_ok
+        and float(det_score) >= SAVE_DET_SCORE
+        and int(face_width) >= SAVE_MIN_WIDTH
+        and float(blur) >= MIN_BLUR
+        and (not yaw_known or yaw_abs <= SAVE_MAX_YAW)
+    )
+    if not save_ok:
+        return label_ok, False, 0.0
+    yaw_term = 1.0 if not yaw_known else max(0.0, 1.0 - yaw_abs / 90.0)
+    quality = (
+        float(det_score)
+        * yaw_term
+        * min(float(blur) / 200.0, 1.5)
+        * min(int(face_width) / 120.0, 1.5)
+    )
+    return True, True, quality
+
+
+def blacklist_alarm_ready(kind: str, score: float) -> bool:
+    return kind == "blacklist" and float(score) >= BLACKLIST_THRESHOLD
+
+
+@dataclass
+class FaceHit:
+    embedding: np.ndarray
+    box: tuple[int, int, int, int]
+    det_score: float
+    yaw: float | None
+    blur: float
+    quality: float
+    save_ok: bool
+    label_ok: bool
+
+
 def embed_image(bgr: np.ndarray) -> np.ndarray | None:
     faces = _faces(bgr)
     if not faces:
@@ -61,7 +134,7 @@ def embed_image(bgr: np.ndarray) -> np.ndarray | None:
     return _vector(face)
 
 
-def embed_upper_body(frame: np.ndarray, coords) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+def embed_upper_body(frame: np.ndarray, coords) -> FaceHit | None:
     """Embed the face in the top of a person box. Bbox is in the original frame."""
     crop, origin = _upper_crop(frame, coords)
     if crop is None:
@@ -70,7 +143,42 @@ def embed_upper_body(frame: np.ndarray, coords) -> tuple[np.ndarray, tuple[int, 
     if not faces:
         return None
     face = max(faces, key=lambda item: float(item.det_score))
-    return _vector(face), _frame_box(face.bbox, origin, frame.shape)
+    box = _frame_box(face.bbox, origin, frame.shape)
+    face_crop = _crop_box(frame, _padded_box(box, frame.shape))
+    blur = blur_score(face_crop)
+    width = box[2] - box[0]
+    yaw = face_yaw(face)
+    det_score = float(face.det_score)
+    label_ok, save_ok, quality = assess_face(det_score, width, blur, yaw)
+    return FaceHit(
+        embedding=_vector(face),
+        box=box,
+        det_score=det_score,
+        yaw=yaw,
+        blur=blur,
+        quality=quality,
+        save_ok=save_ok,
+        label_ok=label_ok,
+    )
+
+
+def _padded_box(box, shape, pad: float = 0.18) -> tuple[int, int, int, int]:
+    height, width = shape[:2]
+    left, top, right, bottom = box
+    face_w = right - left
+    face_h = bottom - top
+    grow_x = int(face_w * pad)
+    grow_y = int(face_h * pad)
+    left = max(0, left - grow_x)
+    top = max(0, top - grow_y)
+    right = min(width, right + grow_x)
+    bottom = min(height, bottom + grow_y)
+    return left, top, max(left + 1, right), max(top + 1, bottom)
+
+
+def _crop_box(frame: np.ndarray, box) -> np.ndarray:
+    left, top, right, bottom = box
+    return frame[top:bottom, left:right]
 
 
 def _upper_crop(frame: np.ndarray, coords):
@@ -181,6 +289,26 @@ def best_match(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> 
 def best_name(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> str:
     name, _score = best_match(embedding, gallery)
     return name
+
+
+def best_person(embedding: np.ndarray, gallery: list[tuple]) -> tuple[object | None, float]:
+    """Pick a person the same way as best_match. A close second name is rejected."""
+    query = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    scored: list[tuple[float, object]] = []
+    for person, stored in gallery:
+        vector = np.asarray(stored, dtype=np.float32).reshape(-1)
+        if vector.size != query.size or vector.size != EMBED_DIM:
+            continue
+        scored.append((similarity(query, vector), person))
+    if not scored:
+        return None, 0.0
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, chosen = scored[0]
+    if best_score < MATCH_THRESHOLD:
+        return None, best_score
+    if len(scored) > 1 and best_score - scored[1][0] < MATCH_MARGIN:
+        return None, best_score
+    return chosen, best_score
 
 
 def next_identity(

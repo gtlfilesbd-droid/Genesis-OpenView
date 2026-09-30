@@ -92,7 +92,7 @@ async function tick() {
     const confidenceCell = document.createElement("td");
     const zoneCell = document.createElement("td");
     objectCell.textContent = item.label;
-    nameCell.textContent = item.name || "—";
+    nameCell.textContent = item.name ? (item.list ? item.name + " · " + item.list : item.name) : "—";
     confidenceCell.textContent = Math.round(item.confidence * 100) + "%";
     zoneCell.textContent = item.class_id === 0 && item.inside ? item.dwell + "s" : "—";
     row.append(objectCell, nameCell, confidenceCell, zoneCell);

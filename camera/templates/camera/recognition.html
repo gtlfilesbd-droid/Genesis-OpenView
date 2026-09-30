@@ -1,0 +1,35 @@
+{% extends "camera/base.html" %}
+{% block title %}Recognition{% endblock %}
+{% block content %}
+<h1>Recognition</h1>
+<p class="muted">Clear faces from the camera that is running. The time under each photo is when that frame was saved.</p>
+{% if not captures %}
+  <p class="muted">No faces captured yet. Start a camera and a clear face will appear here.</p>
+{% else %}
+  <div class="cards">
+    {% for capture in captures %}
+    <article class="panel">
+      <img class="shot" src="{{ capture.face_crop.url }}" alt="Captured face">
+      <p>
+        <strong>{{ capture.matched_name|default:"Unknown" }}</strong>
+        {% if capture.person %}
+          <span class="badge {{ capture.person.list_status }}">{{ capture.person.list_status }}</span>
+        {% else %}
+          <span class="badge unknown">unknown</span>
+        {% endif %}
+      </p>
+      <p class="muted">Camera {{ capture.camera_number }}<br>{{ capture.created_at|date:"Y-m-d H:i:s" }}</p>
+      {% if capture.match_score is not None %}<p class="muted">Score {{ capture.match_score|floatformat:3 }}</p>{% endif %}
+      <form method="post" action="{% url 'capture_classify' capture.pk %}">
+        {% csrf_token %}
+        <label>Name <input name="name" value="{{ capture.matched_name }}" required></label>
+        <div class="row">
+          <button type="submit" name="list_status" value="whitelist">Whitelist</button>
+          <button class="danger" type="submit" name="list_status" value="blacklist">Blacklist</button>
+        </div>
+      </form>
+    </article>
+    {% endfor %}
+  </div>
+{% endif %}
+{% endblock %}
