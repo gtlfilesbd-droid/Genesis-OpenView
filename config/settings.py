@@ -10,10 +10,24 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _env_value(key: str, default: str = "") -> str:
+    env_path = BASE_DIR / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == key:
+                return value.strip().strip('"').strip("'")
+    return os.environ.get(key, default).strip()
 
 
 # Quick-start development settings - unsuitable for production
@@ -25,7 +39,8 @@ SECRET_KEY = 'django-insecure-8=k_5e2^3#lu_a724g=w1mp)=amxs8ab=^w!mokznn$nis4naj
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+_hosts = _env_value("ALLOWED_HOSTS", "127.0.0.1,localhost")
+ALLOWED_HOSTS = [host.strip() for host in _hosts.split(",") if host.strip()]
 
 
 # Application definition
