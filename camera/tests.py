@@ -182,6 +182,33 @@ class FaceQualityTests(TestCase):
         self.assertEqual(chosen, "Ashraf")
         self.assertGreater(score, 0.9)
 
+    def test_front_face_yaw_is_near_zero(self):
+        import numpy as np
+
+        from camera.services.faces import yaw_from_kps
+
+        kps = np.array(
+            [[30, 40], [70, 40], [50, 55], [35, 75], [65, 75]],
+            dtype=np.float32,
+        )
+        yaw = yaw_from_kps(kps)
+        self.assertIsNotNone(yaw)
+        self.assertLess(abs(yaw), 8)
+        self.assertIsNone(yaw_from_kps(None))
+
+    def test_turned_face_yaw_is_large(self):
+        import numpy as np
+
+        from camera.services.faces import SAVE_MAX_YAW, yaw_from_kps
+
+        kps = np.array(
+            [[30, 40], [70, 40], [78, 55], [40, 75], [80, 75]],
+            dtype=np.float32,
+        )
+        yaw = yaw_from_kps(kps)
+        self.assertIsNotNone(yaw)
+        self.assertGreater(abs(yaw), SAVE_MAX_YAW)
+
     def test_stamp_adds_a_time_bar(self):
         import numpy as np
 

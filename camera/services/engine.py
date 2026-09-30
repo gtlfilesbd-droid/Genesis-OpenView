@@ -125,7 +125,7 @@ class Engine:
         self._zone_at = 0.0
         self._last_draw: list[tuple] = []
         self._last_polygon: list[tuple[float, float]] = []
-        self._face_job = None
+        self._face_jobs: dict[int, tuple] = {}
         self._face_lock = threading.Lock()
         threading.Thread(target=self._face_worker, name="face-match", daemon=True).start()
 
@@ -157,6 +157,8 @@ class Engine:
         self._name_try_at = {}
         self._capture_ids = {}
         self._alarmed_tracks = set()
+        with self._face_lock:
+            self._face_jobs = {}
         self._last_draw = []
         self._last_polygon = []
         self._zone_at = 0.0
@@ -501,9 +503,13 @@ class Engine:
         return gallery
 
     def _queue_face(self, generation: int, frame, person_boxes, now: float) -> None:
-        from .faces import model_ready
+        from .faces import model_ready, take_head
 
         live_ids = {int(track_id) for track_id, _coords in person_boxes}
+        with self._face_lock:
+            self._face_jobs = {
+                track_id: job for track_id, job in self._face_jobs.items() if track_id in live_ids
+            }
         with self._lock:
             self._names = {track_id: name for track_id, name in self._names.items() if track_id in live_ids}
             self._name_scores = {
@@ -528,55 +534,51 @@ class Engine:
             pending = []
             for track_id, coords in person_boxes:
                 track_id = int(track_id)
-                wait = 4.0 if track_id in self._names else 1.5
+                wait = 2.0 if track_id in self._names else 0.35
                 if now - self._name_try_at.get(track_id, 0) >= wait:
                     pending.append((track_id, coords))
         if not pending or not model_ready():
             return
+        for track_id, coords in pending:
+            taken = take_head(frame, coords)
+            with self._lock:
+                self._name_try_at[track_id] = now
+            if taken is None:
+                continue
+            crop, origin, shape = taken
+            with self._face_lock:
+                self._face_jobs[track_id] = (generation, crop, origin, shape, track_id, now)
+
+    def _pop_face_job(self):
         with self._face_lock:
-            if self._face_job is not None:
-                return
-        pending.sort(key=lambda item: self._name_try_at.get(item[0], 0))
-        track_id, coords = pending[0]
-        snapshot = frame.copy()
-        with self._lock:
-            self._name_try_at[track_id] = now
-        with self._face_lock:
-            if self._face_job is None:
-                self._face_job = (generation, snapshot, track_id, coords)
+            if not self._face_jobs:
+                return None
+            track_id = min(self._face_jobs, key=lambda item: self._face_jobs[item][5])
+            return self._face_jobs.pop(track_id)
 
     def _face_worker(self) -> None:
         while True:
-            with self._face_lock:
-                job = self._face_job
-                self._face_job = None
+            job = self._pop_face_job()
             if job is None:
-                time.sleep(0.05)
+                time.sleep(0.02)
                 continue
-            generation, frame, track_id, coords = job
+            generation, crop, origin, shape, track_id, _queued = job
             if generation != self._generation:
                 continue
             try:
                 from django.db import close_old_connections
 
                 close_old_connections()
-                self._match_face(frame, track_id, coords)
+                self._match_face(crop, origin, shape, track_id)
             except Exception:
                 print("face match error")
 
-    def _match_face(self, frame, track_id: int, coords) -> None:
+    def _match_face(self, crop, origin, shape, track_id: int) -> None:
         from .captures import save_visit
-        from .faces import (
-            _crop_box,
-            _padded_box,
-            best_person,
-            blacklist_alarm_ready,
-            embed_upper_body,
-            next_identity,
-        )
+        from .faces import best_person, blacklist_alarm_ready, embed_head, next_identity
 
-        found = embed_upper_body(frame, coords)
-        if found is None or not (found.label_ok or found.save_ok):
+        found = embed_head(crop, origin, shape)
+        if found is None or not found.save_ok:
             return
         people = self._gallery_people()
         name = ""
@@ -609,13 +611,12 @@ class Engine:
             known_capture = self._capture_ids.get(track_id)
             already_alarmed = track_id in self._alarmed_tracks
         person = next((item for item, _vector in people if item.pk == person_id), None)
-        if found.save_ok:
-            crop = _crop_box(frame, _padded_box(found.box, frame.shape))
+        if found.save_ok and found.photo is not None and found.photo.size:
             capture_id = save_visit(
                 self.camera_number,
                 track_id,
                 found.embedding,
-                crop,
+                found.photo,
                 found.det_score,
                 found.quality,
                 person if locked_name else None,
@@ -627,20 +628,20 @@ class Engine:
                 with self._lock:
                     self._capture_ids[track_id] = capture_id
         if blacklist_alarm_ready(kind, locked_score) and not already_alarmed and person is not None:
-            if self._raise_list_alarm(frame, track_id, coords, person, locked_score, found):
+            if self._raise_list_alarm(crop, origin, track_id, person, locked_score, found):
                 with self._lock:
                     self._alarmed_tracks.add(track_id)
 
-    def _raise_list_alarm(self, frame, track_id: int, coords, person, score: float, found) -> bool:
+    def _raise_list_alarm(self, crop, origin, track_id: int, person, score: float, found) -> bool:
         from django.core.files.base import ContentFile
         from django.utils import timezone
 
         from camera.models import Alarm
 
-        from .faces import _crop_box, _padded_box, to_bytes
+        from .faces import box_on_crop, to_bytes
 
-        plotted = frame.copy()
-        _draw_box(plotted, coords, f"{person.name} · blacklist", "blacklist")
+        plotted = crop.copy()
+        _draw_box(plotted, box_on_crop(found.box, origin, crop.shape), f"{person.name} · blacklist", "blacklist")
         ok, jpeg = cv2.imencode(".jpg", plotted)
         if not ok:
             return False
@@ -654,9 +655,9 @@ class Engine:
         stamp = timezone.now().strftime("%Y%m%d-%H%M%S")
         alarm.snapshot.save(f"{stamp}-{int(track_id)}-list.jpg", ContentFile(jpeg.tobytes()), save=False)
         alarm.face_embedding = to_bytes(found.embedding)
-        crop = _crop_box(frame, _padded_box(found.box, frame.shape))
-        if crop.size:
-            ok_crop, crop_jpeg = cv2.imencode(".jpg", crop)
+        face = found.photo
+        if face is not None and face.size:
+            ok_crop, crop_jpeg = cv2.imencode(".jpg", face)
             if ok_crop:
                 alarm.face_crop.save(
                     f"{stamp}-{int(track_id)}-list-face.jpg",

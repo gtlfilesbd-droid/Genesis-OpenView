@@ -1,3 +1,4 @@
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,9 @@ SAVE_MAX_YAW = 30.0
 MIN_BLUR = 45.0
 BLACKLIST_THRESHOLD = 0.52
 DEDUP_SIMILARITY = 0.55
+LIVE_DET_SIZE = (320, 320)
+ENROLL_DET_SIZE = (640, 640)
+_ORT_THREADS = 2
 
 _app = None
 _init_lock = threading.Lock()
@@ -39,29 +43,62 @@ def _analysis():
     global _app
     with _init_lock:
         if _app is None:
+            os.environ.setdefault("OMP_NUM_THREADS", str(_ORT_THREADS))
+            import onnxruntime as ort
             from insightface.app import FaceAnalysis
 
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = _ORT_THREADS
+            options.inter_op_num_threads = 1
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             app = FaceAnalysis(
                 name="buffalo_l",
                 root=str(ROOT),
+                allowed_modules=["detection", "recognition"],
                 providers=["CPUExecutionProvider"],
+                sess_options=options,
             )
-            app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=MIN_DET_SCORE)
+            app.prepare(
+                ctx_id=-1,
+                det_size=[LIVE_DET_SIZE, ENROLL_DET_SIZE],
+                det_thresh=MIN_DET_SCORE,
+            )
             _app = app
         return _app
 
 
-def _faces(bgr: np.ndarray):
+def _detect(image: np.ndarray, det_size: tuple[int, int]):
     app = _analysis()
     with _infer_lock:
-        found = app.get(bgr)
-    if not found:
-        return []
-    return [face for face in found if float(face.det_score) >= MIN_DET_SCORE]
+        bboxes, kpss = app.det_model.detect(image, input_size=det_size, max_num=1)
+    if bboxes is None or len(bboxes) == 0:
+        return None
+    index = int(np.argmax(bboxes[:, 4]))
+    if float(bboxes[index, 4]) < MIN_DET_SCORE:
+        return None
+    kps = None if kpss is None else kpss[index]
+    return bboxes[index], kps
 
 
-def _vector(face) -> np.ndarray:
-    return np.asarray(face.normed_embedding, dtype=np.float32).reshape(-1)
+def _recognize(image: np.ndarray, bbox, kps) -> np.ndarray | None:
+    if kps is None:
+        return None
+    from insightface.app.common import Face
+
+    face = Face(
+        bbox=np.asarray(bbox[:4], dtype=np.float32),
+        kps=np.asarray(kps, dtype=np.float32),
+        det_score=float(bbox[4]),
+    )
+    app = _analysis()
+    with _infer_lock:
+        app.models["recognition"].get(image, face)
+    if face.normed_embedding is None:
+        return None
+    vector = np.asarray(face.normed_embedding, dtype=np.float32).reshape(-1)
+    if vector.size != EMBED_DIM:
+        return None
+    return vector
 
 
 def blur_score(image: np.ndarray) -> float:
@@ -72,7 +109,26 @@ def blur_score(image: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def yaw_from_kps(kps) -> float | None:
+    """Estimate yaw in degrees from the detector's 5 points. Frontal is near zero."""
+    if kps is None:
+        return None
+    points = np.asarray(kps, dtype=np.float32).reshape(-1, 2)
+    if points.shape[0] < 3:
+        return None
+    left_eye, right_eye, nose = points[0], points[1], points[2]
+    distance = float(np.hypot(right_eye[0] - left_eye[0], right_eye[1] - left_eye[1]))
+    if distance < 1.0:
+        return None
+    mid_x = (float(left_eye[0]) + float(right_eye[0])) / 2.0
+    offset = (float(nose[0]) - mid_x) / distance
+    return offset * 70.0
+
+
 def face_yaw(face) -> float | None:
+    yaw = yaw_from_kps(getattr(face, "kps", None))
+    if yaw is not None:
+        return yaw
     pose = getattr(face, "pose", None)
     if pose is None:
         return None
@@ -124,42 +180,64 @@ class FaceHit:
     quality: float
     save_ok: bool
     label_ok: bool
+    photo: np.ndarray
 
 
 def embed_image(bgr: np.ndarray) -> np.ndarray | None:
-    faces = _faces(bgr)
-    if not faces:
+    detected = _detect(bgr, ENROLL_DET_SIZE)
+    if detected is None:
         return None
-    face = max(faces, key=lambda item: float(item.det_score))
-    return _vector(face)
+    bbox, kps = detected
+    return _recognize(bgr, bbox, kps)
 
 
-def embed_upper_body(frame: np.ndarray, coords) -> FaceHit | None:
-    """Embed the face in the top of a person box. Bbox is in the original frame."""
+def take_head(frame: np.ndarray, coords):
+    """Copy only the head region the face worker needs."""
     crop, origin = _upper_crop(frame, coords)
     if crop is None:
         return None
-    faces = _faces(crop)
-    if not faces:
+    return crop.copy(), origin, tuple(frame.shape)
+
+
+def embed_head(crop: np.ndarray, origin, frame_shape) -> FaceHit | None:
+    """Detect on a head crop at 320. ArcFace runs only when the face is clear."""
+    detected = _detect(crop, LIVE_DET_SIZE)
+    if detected is None:
         return None
-    face = max(faces, key=lambda item: float(item.det_score))
-    box = _frame_box(face.bbox, origin, frame.shape)
-    face_crop = _crop_box(frame, _padded_box(box, frame.shape))
-    blur = blur_score(face_crop)
+    bbox, kps = detected
+    box = _frame_box(bbox, origin, frame_shape)
+    local = _frame_box(bbox, (0, 0, 1.0), crop.shape)
+    photo = _crop_box(crop, _padded_box(local, crop.shape))
+    blur = blur_score(photo)
     width = box[2] - box[0]
-    yaw = face_yaw(face)
-    det_score = float(face.det_score)
+    yaw = yaw_from_kps(kps)
+    det_score = float(bbox[4])
     label_ok, save_ok, quality = assess_face(det_score, width, blur, yaw)
+    if not save_ok:
+        return None
+    embedding = _recognize(crop, bbox, kps)
+    if embedding is None:
+        return None
     return FaceHit(
-        embedding=_vector(face),
+        embedding=embedding,
         box=box,
         det_score=det_score,
         yaw=yaw,
         blur=blur,
         quality=quality,
-        save_ok=save_ok,
+        save_ok=True,
         label_ok=label_ok,
+        photo=photo,
     )
+
+
+def embed_upper_body(frame: np.ndarray, coords) -> FaceHit | None:
+    """Embed the face in the top of a person box. Bbox is in the original frame."""
+    taken = take_head(frame, coords)
+    if taken is None:
+        return None
+    crop, origin, shape = taken
+    return embed_head(crop, origin, shape)
 
 
 def _padded_box(box, shape, pad: float = 0.18) -> tuple[int, int, int, int]:
@@ -181,6 +259,23 @@ def _crop_box(frame: np.ndarray, box) -> np.ndarray:
     return frame[top:bottom, left:right]
 
 
+def box_on_crop(frame_box, origin, crop_shape) -> tuple[int, int, int, int]:
+    """Map a full-frame face box back onto the head crop."""
+    ox, oy, scale = origin
+    scale = scale or 1.0
+    x1, y1, x2, y2 = frame_box
+    height, width = crop_shape[:2]
+    left = int(round((x1 - ox) * scale))
+    top = int(round((y1 - oy) * scale))
+    right = int(round((x2 - ox) * scale))
+    bottom = int(round((y2 - oy) * scale))
+    left = min(max(0, left), max(0, width - 1))
+    top = min(max(0, top), max(0, height - 1))
+    right = min(max(left + 1, right), width)
+    bottom = min(max(top + 1, bottom), height)
+    return left, top, right, bottom
+
+
 def _upper_crop(frame: np.ndarray, coords):
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = [int(value) for value in coords]
@@ -192,11 +287,7 @@ def _upper_crop(frame: np.ndarray, coords):
     crop = frame[y1 : y1 + max(1, int(box_height * 0.55)), x1:x2]
     if crop.size == 0:
         return None, (0, 0, 1.0)
-    scale = 1.0
-    if crop.shape[0] < 180:
-        scale = 180 / crop.shape[0]
-        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    return crop, (x1, y1, scale)
+    return crop, (x1, y1, 1.0)
 
 
 def _frame_box(bbox, origin, shape) -> tuple[int, int, int, int]:
