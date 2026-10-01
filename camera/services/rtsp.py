@@ -68,6 +68,14 @@ def parse_channel(url: str) -> tuple[int, str]:
     return camera, stream
 
 
+def configured_camera() -> tuple[int, str]:
+    """Camera and stream from RTSP_URL, or camera 1 sub when that URL has no channel."""
+    url = load_env_value("RTSP_URL")
+    if not url or "user:password@host" in url or not _CHANNEL.search(url):
+        return 1, "sub"
+    return parse_channel(url)
+
+
 def stream_url(camera_number: int, stream: str) -> tuple[str, str]:
     """Hikvision channel: camera 1 sub is 102, camera 12 sub is 1202."""
     suffix = "01" if stream == "main" else "02"

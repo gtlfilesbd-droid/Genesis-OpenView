@@ -16,7 +16,7 @@ from ultralytics import YOLO
 from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
 from .dwell import DwellTracker
 from .geom import point_in_polygon
-from .rtsp import ROOT, base_rtsp_url, parse_channel, stream_url
+from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
 
 _stderr_lock = threading.Lock()
 _RTSP_SECRET = re.compile(r"rtsp://\S+", re.IGNORECASE)
@@ -175,13 +175,18 @@ def _read_until_frame(capture, stop_event: threading.Event, seconds: float = 3):
 
 def probe_stream(url: str) -> str:
     """Return '' when one frame arrives, otherwise a short public error."""
-    capture, log = _with_ffmpeg_log(lambda: _open_capture(url))
-    try:
+
+    def _open_and_read():
+        capture = _open_capture(url)
         if not capture.isOpened():
+            return capture, False
+        ok, _frame = _read_until_frame(capture, threading.Event(), seconds=8)
+        return capture, ok
+
+    (capture, ok), log = _with_ffmpeg_log(_open_and_read)
+    try:
+        if not capture.isOpened() or not ok:
             return rtsp_failure_message(log)
-        ok, _frame = _read_until_frame(capture, threading.Event())
-        if not ok:
-            return rtsp_failure_message(log) if log.strip() else "Could not read the camera."
         return ""
     finally:
         capture.release()
@@ -233,10 +238,11 @@ class Engine:
             return
         self._defaults_ready = True
         try:
-            camera, stream = parse_channel(base_rtsp_url())
+            base_rtsp_url()
         except RuntimeError as exc:
             self.error = str(exc)
             return
+        camera, stream = configured_camera()
         if not self.running:
             self.camera_number = camera
             self.stream = stream

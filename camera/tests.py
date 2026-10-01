@@ -190,6 +190,174 @@ class NvrSettingsTests(TestCase):
         self.assertContains(page, 'type="password"')
         self.assertContains(page, 'value="pass@word"')
 
+    def test_ensure_defaults_keeps_the_env_channel_after_nvr_is_saved(self):
+        from camera.models import Nvr
+        from camera.services import rtsp
+        from camera.services.engine import engine
+
+        Nvr.objects.create(host="192.168.168.73", username="admin", password="secret")
+        previous = (
+            engine._defaults_ready,
+            engine.running,
+            engine.camera_number,
+            engine.stream,
+            engine.error,
+        )
+        engine._defaults_ready = False
+        engine.running = False
+        engine.camera_number = 1
+        engine.stream = "main"
+        engine.error = ""
+        original = rtsp.load_env_value
+        rtsp.load_env_value = (
+            lambda key: "rtsp://admin:secret@192.168.168.73:554/Streaming/Channels/1202"
+            if key == "RTSP_URL"
+            else ""
+        )
+        try:
+            engine.ensure_defaults()
+            self.assertEqual(engine.camera_number, 12)
+            self.assertEqual(engine.stream, "sub")
+            self.assertEqual(engine.error, "")
+        finally:
+            rtsp.load_env_value = original
+            (
+                engine._defaults_ready,
+                engine.running,
+                engine.camera_number,
+                engine.stream,
+                engine.error,
+            ) = previous
+
+    def test_settings_probes_the_env_channel(self):
+        from unittest.mock import patch
+
+        from camera.services import rtsp
+
+        seen = {}
+        original = rtsp.load_env_value
+        rtsp.load_env_value = (
+            lambda key: "rtsp://admin:pass%40word@192.168.1.20:554/Streaming/Channels/1202"
+            if key == "RTSP_URL"
+            else ""
+        )
+
+        def capture(url):
+            seen["url"] = url
+            return ""
+
+        try:
+            with patch("camera.views.probe_stream", side_effect=capture):
+                response = self.client.post(
+                    "/settings/",
+                    {"host": "192.168.168.73", "username": "admin", "password": "secret"},
+                )
+        finally:
+            rtsp.load_env_value = original
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/Streaming/Channels/1202", seen["url"])
+        self.assertIn("192.168.168.73", seen["url"])
+
+    def test_settings_restarts_a_running_camera_after_a_failed_probe(self):
+        from unittest.mock import patch
+
+        from camera.services.engine import engine
+
+        previous = (engine.running, engine.starting, engine.camera_number, engine.stream, engine._thread)
+        engine.running = True
+        engine.starting = False
+        engine.camera_number = 12
+        engine.stream = "sub"
+        engine._thread = None
+        stopped = []
+        started = []
+        original_stop = engine.stop
+        original_start = engine.start
+
+        def stop():
+            stopped.append(True)
+            engine.running = False
+            engine.starting = False
+
+        def start(camera, stream):
+            started.append((camera, stream))
+
+        engine.stop = stop
+        engine.start = start
+        try:
+            with patch("camera.views.probe_stream", return_value="Could not read the camera."):
+                response = self.client.post(
+                    "/settings/",
+                    {"host": "192.168.1.20", "username": "admin", "password": "secret"},
+                )
+        finally:
+            engine.stop = original_stop
+            engine.start = original_start
+            engine.running, engine.starting, engine.camera_number, engine.stream, engine._thread = previous
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(stopped, [True])
+        self.assertEqual(started, [(12, "sub")])
+
+    def test_probe_stream_accepts_a_frame_inside_the_longer_wait(self):
+        import numpy as np
+
+        from camera.services import engine as engine_module
+
+        good = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        class Capture:
+            def isOpened(self):
+                return True
+
+            def release(self):
+                self.released = True
+
+        capture = Capture()
+
+        def read_until(stream, stop_event, seconds=3):
+            self.assertGreaterEqual(seconds, 8)
+            return True, good
+
+        original_open = engine_module._open_capture
+        original_read = engine_module._read_until_frame
+        engine_module._open_capture = lambda url: capture
+        engine_module._read_until_frame = read_until
+        try:
+            reason = engine_module.probe_stream("rtsp://example/Streaming/Channels/1202")
+        finally:
+            engine_module._open_capture = original_open
+            engine_module._read_until_frame = original_read
+        self.assertEqual(reason, "")
+        self.assertTrue(capture.released)
+
+    def test_probe_stream_keeps_ffmpeg_errors_from_the_read(self):
+        import os
+
+        from camera.services import engine as engine_module
+
+        class Capture:
+            def isOpened(self):
+                return True
+
+            def release(self):
+                pass
+
+        def read_until(stream, stop_event, seconds=3):
+            self.assertGreaterEqual(seconds, 8)
+            os.write(2, b"method DESCRIBE failed: 401 Unauthorized\n")
+            return False, None
+
+        original_open = engine_module._open_capture
+        original_read = engine_module._read_until_frame
+        engine_module._open_capture = lambda url: Capture()
+        engine_module._read_until_frame = read_until
+        try:
+            reason = engine_module.probe_stream("rtsp://example/Streaming/Channels/1202")
+        finally:
+            engine_module._open_capture = original_open
+            engine_module._read_until_frame = original_read
+        self.assertEqual(reason, "NVR login was rejected.")
+
     def test_settings_save_reports_probe_failure(self):
         from unittest.mock import patch
 
