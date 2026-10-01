@@ -131,6 +131,76 @@ class ZoneGeometryTests(TestCase):
             rtsp.base_rtsp_url = original
 
 
+class NvrSettingsTests(TestCase):
+    def test_build_rtsp_url_encodes_special_characters(self):
+        from camera.models import Nvr
+        from camera.services.rtsp import base_rtsp_url, build_rtsp_url
+
+        url = build_rtsp_url("192.168.1.10", "admin", "pass@word")
+        self.assertEqual(url, "rtsp://admin:pass%40word@192.168.1.10:554/Streaming/Channels/102")
+        Nvr.objects.create(host="10.0.0.5", username="user", password="p@ss")
+        self.assertEqual(base_rtsp_url(), "rtsp://user:p%40ss@10.0.0.5:554/Streaming/Channels/102")
+
+    def test_settings_prefills_ip_and_username_from_env(self):
+        from camera.services import rtsp
+
+        original = rtsp.load_env_value
+        rtsp.load_env_value = (
+            lambda key: "rtsp://admin:pass%40word@192.168.1.20:554/Streaming/Channels/1202"
+            if key == "RTSP_URL"
+            else ""
+        )
+        try:
+            response = self.client.get("/settings/")
+        finally:
+            rtsp.load_env_value = original
+        self.assertContains(response, 'value="192.168.1.20"')
+        self.assertContains(response, 'value="admin"')
+        self.assertNotContains(response, "pass@word")
+        self.assertNotContains(response, "Leave the password blank")
+
+    def test_settings_saves_and_keeps_password_when_blank(self):
+        from camera.models import Nvr
+
+        created = self.client.post(
+            "/settings/",
+            {"host": "192.168.1.20", "username": "admin", "password": "pass@word"},
+        )
+        self.assertEqual(created.status_code, 302)
+        nvr = Nvr.objects.get()
+        self.assertEqual((nvr.host, nvr.username, nvr.password), ("192.168.1.20", "admin", "pass@word"))
+
+        updated = self.client.post(
+            "/settings/",
+            {"host": "192.168.68.80", "username": "operator", "password": ""},
+        )
+        self.assertEqual(updated.status_code, 302)
+        nvr.refresh_from_db()
+        self.assertEqual((nvr.host, nvr.username, nvr.password), ("192.168.68.80", "operator", "pass@word"))
+        self.assertEqual(Nvr.objects.count(), 1)
+
+        page = self.client.get("/settings/")
+        self.assertNotContains(page, "Leave the password blank")
+        self.assertContains(page, 'value="192.168.68.80"')
+        self.assertContains(page, 'type="password"')
+        self.assertContains(page, 'value="pass@word"')
+
+    def test_settings_rejects_bad_ip_and_missing_first_password(self):
+        from camera.models import Nvr
+
+        bad_ip = self.client.post(
+            "/settings/",
+            {"host": "not-an-ip", "username": "admin", "password": "secret"},
+        )
+        self.assertContains(bad_ip, "Enter a valid IPv4 address.")
+        missing = self.client.post(
+            "/settings/",
+            {"host": "192.168.1.2", "username": "admin", "password": ""},
+        )
+        self.assertContains(missing, "Password is required.")
+        self.assertEqual(Nvr.objects.count(), 0)
+
+
 class FaceQualityTests(TestCase):
     def test_flat_frame_is_blurrier_than_a_sharp_pattern(self):
         import numpy as np

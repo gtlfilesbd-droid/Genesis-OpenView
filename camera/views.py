@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import time
 
@@ -7,7 +8,8 @@ from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .models import Alarm, FaceCapture, Person, PersonSample, Zone
+from .models import Alarm, FaceCapture, Nvr, Person, PersonSample, Zone
+from .services.rtsp import env_nvr_fields
 from .services.engine import engine, grab_jpeg
 from .services.faces import (
     MATCH_THRESHOLD,
@@ -18,6 +20,13 @@ from .services.faces import (
     to_bytes,
 )
 from .services.gallery import add_sample, load_person_vector, load_person_vectors
+
+
+def _ipv4(value: str) -> str:
+    try:
+        return str(ipaddress.IPv4Address(value.strip()))
+    except (ValueError, ipaddress.AddressValueError):
+        return ""
 
 
 def _camera_number(value, default: int) -> int:
@@ -365,6 +374,55 @@ def sample_delete(request, pk, sample_pk):
         person.save()
     engine._gallery_at = 0.0
     return redirect("people")
+
+
+def settings(request):
+    nvr = Nvr.objects.order_by("pk").first()
+    if nvr is not None:
+        host, username = nvr.host, nvr.username
+        password_value = nvr.password
+    else:
+        host, username = env_nvr_fields()
+        password_value = ""
+    if request.method == "POST":
+        host = request.POST.get("host", "").strip()
+        username = request.POST.get("username", "").strip()
+        password = request.POST.get("password", "")
+        if password != "":
+            password_value = password
+        ip = _ipv4(host)
+        if not ip:
+            messages.error(request, "Enter a valid IPv4 address.")
+        elif not username:
+            messages.error(request, "Username is required.")
+        elif nvr is None and password == "":
+            messages.error(request, "Password is required.")
+        else:
+            if nvr is None:
+                Nvr.objects.create(host=ip, username=username, password=password)
+            else:
+                nvr.host = ip
+                nvr.username = username
+                if password != "":
+                    nvr.password = password
+                nvr.save()
+                Nvr.objects.exclude(pk=nvr.pk).delete()
+            messages.success(request, "NVR saved.")
+            if engine.running or engine.starting:
+                engine.start(engine.camera_number, engine.stream)
+            else:
+                with engine._lock:
+                    engine.error = ""
+            return redirect("settings")
+    return render(
+        request,
+        "camera/settings.html",
+        {
+            "host": host,
+            "username": username,
+            "password": password_value,
+        },
+    )
 
 
 def search(request):

@@ -1,0 +1,20 @@
+{% extends "camera/base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<section class="panel" style="max-width: 420px;">
+  <form method="post">
+    {% csrf_token %}
+    <label>NVR IP
+      <input type="text" name="host" value="{{ host }}" required autocomplete="off" inputmode="decimal" style="width: 100%;">
+    </label>
+    <label>Username
+      <input type="text" name="username" value="{{ username }}" required autocomplete="off" style="width: 100%;">
+    </label>
+    <label>Password
+      <input type="password" name="password" value="{{ password }}" autocomplete="off" style="width: 100%;" {% if not password %}required{% endif %}>
+    </label>
+    <button type="submit">Save</button>
+  </form>
+</section>
+{% endblock %}

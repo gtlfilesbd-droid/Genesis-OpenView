@@ -274,7 +274,7 @@ class Engine:
         try:
             url, channel = stream_url(self.camera_number, self.stream)
         except Exception:
-            self._fail(generation, "Set RTSP_URL in .env")
+            self._fail(generation, "Set the NVR in Settings")
             return
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # The small model keeps the CPU preview smooth. CUDA can carry the larger one.

@@ -12,6 +12,15 @@ class Zone(models.Model):
         return f"Camera {self.camera_number} door"
 
 
+class Nvr(models.Model):
+    host = models.CharField(max_length=64)
+    username = models.CharField(max_length=128)
+    password = models.CharField(max_length=128)
+
+    def __str__(self) -> str:
+        return self.host
+
+
 class Person(models.Model):
     WHITELIST = "whitelist"
     BLACKLIST = "blacklist"

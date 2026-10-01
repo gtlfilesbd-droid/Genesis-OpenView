@@ -20,4 +20,5 @@ urlpatterns = [
     path("people/<int:pk>/samples/", views.person_samples, name="person_samples"),
     path("people/<int:pk>/samples/<int:sample_pk>/delete/", views.sample_delete, name="sample_delete"),
     path("search/", views.search, name="search"),
+    path("settings/", views.settings, name="settings"),
 ]

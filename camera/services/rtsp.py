@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 _CHANNEL = re.compile(r"/Streaming/Channels/\d+")
@@ -19,10 +20,41 @@ def load_env_value(key: str) -> str:
     return os.environ.get(key, "").strip()
 
 
-def base_rtsp_url() -> str:
+def build_rtsp_url(host: str, username: str, password: str) -> str:
+    user = quote(username, safe="")
+    secret = quote(password, safe="")
+    return f"rtsp://{user}:{secret}@{host}:554/Streaming/Channels/102"
+
+
+def saved_nvr_url() -> str:
+    try:
+        from camera.models import Nvr
+    except Exception:
+        return ""
+    try:
+        nvr = Nvr.objects.order_by("pk").first()
+    except Exception:
+        return ""
+    if nvr is None or not nvr.host or not nvr.username:
+        return ""
+    return build_rtsp_url(nvr.host, nvr.username, nvr.password)
+
+
+def env_nvr_fields() -> tuple[str, str]:
     url = load_env_value("RTSP_URL")
     if not url or "user:password@host" in url:
-        raise RuntimeError("Set RTSP_URL in .env")
+        return "", ""
+    parsed = urlparse(url)
+    return parsed.hostname or "", unquote(parsed.username or "")
+
+
+def base_rtsp_url() -> str:
+    stored = saved_nvr_url()
+    if stored:
+        return stored
+    url = load_env_value("RTSP_URL")
+    if not url or "user:password@host" in url:
+        raise RuntimeError("Set the NVR in Settings")
     return url
 
 
