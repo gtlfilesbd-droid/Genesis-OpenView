@@ -425,7 +425,7 @@ def settings(request):
                 messages.error(request, f"NVR saved, but the camera did not open. {reason}")
             else:
                 messages.success(request, "NVR saved.")
-            if was_running:
+            if was_running and not reason:
                 engine.start(resume_camera, resume_stream)
             else:
                 with engine._lock:

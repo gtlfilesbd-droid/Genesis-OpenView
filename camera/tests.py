@@ -296,7 +296,7 @@ class NvrSettingsTests(TestCase):
             engine.running, engine.starting, engine.camera_number, engine.stream, engine._thread = previous
         self.assertEqual(response.status_code, 302)
         self.assertEqual(stopped, [True])
-        self.assertEqual(started, [(12, "sub")])
+        self.assertEqual(started, [])
 
     def test_probe_stream_accepts_a_frame_inside_the_longer_wait(self):
         import numpy as np
@@ -330,33 +330,83 @@ class NvrSettingsTests(TestCase):
         self.assertEqual(reason, "")
         self.assertTrue(capture.released)
 
-    def test_probe_stream_keeps_ffmpeg_errors_from_the_read(self):
-        import os
-
+    def test_probe_stream_reports_a_fast_refusal(self):
         from camera.services import engine as engine_module
 
         class Capture:
             def isOpened(self):
-                return True
+                return False
 
             def release(self):
                 pass
 
-        def read_until(stream, stop_event, seconds=3):
-            self.assertGreaterEqual(seconds, 8)
-            os.write(2, b"method DESCRIBE failed: 401 Unauthorized\n")
-            return False, None
-
         original_open = engine_module._open_capture
-        original_read = engine_module._read_until_frame
         engine_module._open_capture = lambda url: Capture()
-        engine_module._read_until_frame = read_until
         try:
             reason = engine_module.probe_stream("rtsp://example/Streaming/Channels/1202")
         finally:
             engine_module._open_capture = original_open
-            engine_module._read_until_frame = original_read
+        self.assertEqual(reason, engine_module.NVR_LOCK_MESSAGE)
+
+    def test_describe_rtsp_reports_a_rejected_digest_login(self):
+        from camera.services import rtsp
+
+        class Sock:
+            def __init__(self):
+                self.reads = [
+                    b'RTSP/1.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm="r", nonce="n"\r\n\r\n',
+                    b"RTSP/1.0 401 Unauthorized\r\n\r\n",
+                ]
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _data):
+                pass
+
+            def recv(self, _size):
+                return self.reads.pop(0) if self.reads else b""
+
+            def close(self):
+                pass
+
+        original = rtsp.socket.create_connection
+        rtsp.socket.create_connection = lambda *_args, **_kwargs: Sock()
+        try:
+            reason = rtsp.describe_rtsp("rtsp://admin:secret@192.168.1.10:554/Streaming/Channels/1202")
+        finally:
+            rtsp.socket.create_connection = original
         self.assertEqual(reason, "NVR login was rejected.")
+
+    def test_describe_rtsp_accepts_a_digest_login(self):
+        from camera.services import rtsp
+
+        class Sock:
+            def __init__(self):
+                self.reads = [
+                    b'RTSP/1.0 401 Unauthorized\r\nWWW-Authenticate: Digest realm="r", nonce="n", qop="auth"\r\n\r\n',
+                    b"RTSP/1.0 200 OK\r\n\r\n",
+                ]
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _data):
+                pass
+
+            def recv(self, _size):
+                return self.reads.pop(0) if self.reads else b""
+
+            def close(self):
+                pass
+
+        original = rtsp.socket.create_connection
+        rtsp.socket.create_connection = lambda *_args, **_kwargs: Sock()
+        try:
+            reason = rtsp.describe_rtsp("rtsp://admin:secret@192.168.1.10:554/Streaming/Channels/1202")
+        finally:
+            rtsp.socket.create_connection = original
+        self.assertEqual(reason, "")
 
     def test_settings_save_reports_probe_failure(self):
         from unittest.mock import patch

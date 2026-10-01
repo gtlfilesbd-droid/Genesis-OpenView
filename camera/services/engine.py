@@ -173,20 +173,27 @@ def _read_until_frame(capture, stop_event: threading.Event, seconds: float = 3):
     return False, None
 
 
+NVR_LOCK_MESSAGE = (
+    "The NVR refused this login. Open the NVR in a browser on this computer and sign in, then save again."
+)
+
+
 def probe_stream(url: str) -> str:
-    """Return '' when one frame arrives, otherwise a short public error."""
+    """Return '' when one frame arrives, otherwise a short public error.
 
-    def _open_and_read():
-        capture = _open_capture(url)
-        if not capture.isOpened():
-            return capture, False
-        ok, _frame = _read_until_frame(capture, threading.Event(), seconds=8)
-        return capture, ok
-
-    (capture, ok), log = _with_ffmpeg_log(_open_and_read)
+    One attempt only. A second login check, or a retry every few seconds, is enough
+    for a Hikvision NVR to lock this computer until someone signs in on its web page.
+    """
+    started = time.monotonic()
+    capture = _open_capture(url)
     try:
-        if not capture.isOpened() or not ok:
-            return rtsp_failure_message(log)
+        if not capture.isOpened():
+            if time.monotonic() - started < 2:
+                return NVR_LOCK_MESSAGE
+            return "The NVR did not answer."
+        ok, _frame = _read_until_frame(capture, threading.Event(), seconds=8)
+        if not ok:
+            return "The NVR accepted the login, but the camera sent no picture."
         return ""
     finally:
         capture.release()
@@ -397,27 +404,29 @@ class Engine:
             self._fail(generation, "Could not load the detection model.")
             return
         seen_frame = False
-        misses = 0
         while not stop_event.is_set() and generation == self._generation:
-            capture, open_log = _with_ffmpeg_log(lambda: _open_capture(url))
+            started = time.monotonic()
+            capture = _open_capture(url)
             if not capture.isOpened():
                 capture.release()
-                misses += 1
-                reason = rtsp_failure_message(open_log) if misses >= 3 else ""
-                self._mark_reconnect(generation, seen_frame, reason)
-                if stop_event.wait(2):
-                    break
-                continue
+                if seen_frame:
+                    self._mark_reconnect(generation, seen_frame)
+                    if stop_event.wait(30):
+                        break
+                    continue
+                reason = NVR_LOCK_MESSAGE if time.monotonic() - started < 2 else "The NVR did not answer."
+                self._fail(generation, reason)
+                return
             ok, frame = _read_until_frame(capture, stop_event)
             if not ok or frame is None:
                 capture.release()
-                misses += 1
-                reason = "" if seen_frame or misses < 3 else "Could not read the camera."
-                self._mark_reconnect(generation, seen_frame, reason)
-                if stop_event.wait(2):
-                    break
-                continue
-            misses = 0
+                if seen_frame:
+                    self._mark_reconnect(generation, seen_frame)
+                    if stop_event.wait(30):
+                        break
+                    continue
+                self._fail(generation, "The NVR accepted the login, but the camera sent no picture.")
+                return
             seen_frame = True
             with self._lock:
                 if generation == self._generation:
@@ -456,8 +465,10 @@ class Engine:
             if generation == self._generation:
                 self.running = False
                 self.starting = True
-                if not seen_frame:
-                    self.error = reason or "Could not read the camera."
+                if not seen_frame and reason:
+                    self.error = reason
+                elif not seen_frame and not self.error:
+                    self.error = "Could not read the camera."
 
     def _fail(self, generation: int, message: str) -> None:
         with self._lock:

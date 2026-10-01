@@ -1,7 +1,9 @@
+import hashlib
 import os
 import re
+import socket
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 ROOT = Path(__file__).resolve().parents[2]
 _CHANNEL = re.compile(r"/Streaming/Channels/\d+")
@@ -74,6 +76,97 @@ def configured_camera() -> tuple[int, str]:
     if not url or "user:password@host" in url or not _CHANNEL.search(url):
         return 1, "sub"
     return parse_channel(url)
+
+
+def _auth_field(challenge: str, name: str) -> str:
+    match = re.search(rf'{name}="([^"]*)"', challenge, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _digest_authorization(user: str, password: str, uri: str, challenge: str) -> str:
+    realm = _auth_field(challenge, "realm")
+    nonce = _auth_field(challenge, "nonce")
+    qop = _auth_field(challenge, "qop").split(",")[0].strip()
+    ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"DESCRIBE:{uri}".encode()).hexdigest()
+    if qop:
+        nc, cnonce = "00000001", "a1b2c3d4"
+        response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
+        return (
+            f'Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", '
+            f'response="{response}", qop={qop}, nc={nc}, cnonce="{cnonce}"'
+        )
+    response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+    return f'Digest username="{user}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}"'
+
+
+def _rtsp_exchange(sock: socket.socket, request: str) -> tuple[int, str]:
+    sock.sendall(request.encode())
+    chunks: list[bytes] = []
+    while b"\r\n\r\n" not in b"".join(chunks):
+        data = sock.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+    head = b"".join(chunks).split(b"\r\n\r\n", 1)[0].decode("utf-8", "replace")
+    status_line = head.split("\r\n", 1)[0]
+    try:
+        status = int(status_line.split()[1])
+    except (IndexError, ValueError):
+        status = 0
+    challenge = ""
+    for line in head.split("\r\n")[1:]:
+        if line.lower().startswith("www-authenticate:"):
+            challenge = line.split(":", 1)[1].strip()
+            break
+    return status, challenge
+
+
+def describe_rtsp(url: str) -> str:
+    """Return '' when the NVR accepts the login, otherwise a short public error."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or 554
+    user = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+    uri = urlunparse((parsed.scheme or "rtsp", f"{host}:{port}", parsed.path or "/", "", "", ""))
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+    except socket.timeout:
+        return "The NVR did not answer."
+    except OSError:
+        return "Could not reach the NVR."
+    sock.settimeout(5)
+    try:
+        request = f"DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\nUser-Agent: AICamera\r\n\r\n"
+        status, challenge = _rtsp_exchange(sock, request)
+        if status == 200:
+            return ""
+        if status != 401 or "digest" not in challenge.lower():
+            return "NVR login was rejected." if status == 401 else "Could not read the camera."
+        authorization = _digest_authorization(user, password, uri, challenge)
+        authed = (
+            f"DESCRIBE {uri} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n"
+            f"Authorization: {authorization}\r\nUser-Agent: AICamera\r\n\r\n"
+        )
+        try:
+            status, _challenge = _rtsp_exchange(sock, authed)
+        except OSError:
+            sock.close()
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.settimeout(5)
+            status, _challenge = _rtsp_exchange(sock, authed)
+        if status == 200:
+            return ""
+        if status == 401:
+            return "NVR login was rejected."
+        return "Could not read the camera."
+    except socket.timeout:
+        return "The NVR did not answer."
+    except OSError:
+        return "Could not reach the NVR."
+    finally:
+        sock.close()
 
 
 def stream_url(camera_number: int, stream: str) -> tuple[str, str]:
