@@ -222,6 +222,29 @@ class NvrSettingsTests(TestCase):
         self.assertEqual(rtsp_failure_message(""), "Could not read the camera.")
         self.assertIn("rtsp_transport;tcp", os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"])
 
+    def test_read_until_frame_skips_empty_packets(self):
+        import threading
+
+        import numpy as np
+
+        from camera.services.engine import _read_until_frame
+
+        good = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        class Capture:
+            def __init__(self):
+                self.calls = 0
+
+            def read(self):
+                self.calls += 1
+                if self.calls < 3:
+                    return False, None
+                return True, good
+
+        ok, frame = _read_until_frame(Capture(), threading.Event(), seconds=2)
+        self.assertTrue(ok)
+        self.assertIs(frame, good)
+
     def test_ffmpeg_stderr_is_captured(self):
         import os
 

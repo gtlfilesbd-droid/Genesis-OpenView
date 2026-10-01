@@ -163,15 +163,25 @@ def rtsp_failure_message(log: str) -> str:
     return last
 
 
+def _read_until_frame(capture, stop_event: threading.Event, seconds: float = 3):
+    """Skip the broken packets an NVR sends before the first real frame."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not stop_event.is_set():
+        ok, frame = capture.read()
+        if ok and frame is not None and getattr(frame, "size", 0):
+            return True, frame
+    return False, None
+
+
 def probe_stream(url: str) -> str:
     """Return '' when one frame arrives, otherwise a short public error."""
     capture, log = _with_ffmpeg_log(lambda: _open_capture(url))
     try:
         if not capture.isOpened():
             return rtsp_failure_message(log)
-        (ok, frame), read_log = _with_ffmpeg_log(lambda: capture.read())
-        if not ok or frame is None:
-            return rtsp_failure_message(f"{log}\n{read_log}")
+        ok, _frame = _read_until_frame(capture, threading.Event())
+        if not ok:
+            return rtsp_failure_message(log) if log.strip() else "Could not read the camera."
         return ""
     finally:
         capture.release()
@@ -381,15 +391,28 @@ class Engine:
             self._fail(generation, "Could not load the detection model.")
             return
         seen_frame = False
+        misses = 0
         while not stop_event.is_set() and generation == self._generation:
             capture, open_log = _with_ffmpeg_log(lambda: _open_capture(url))
-            read_log = ""
             if not capture.isOpened():
                 capture.release()
-                self._mark_reconnect(generation, seen_frame, rtsp_failure_message(open_log))
+                misses += 1
+                reason = rtsp_failure_message(open_log) if misses >= 3 else ""
+                self._mark_reconnect(generation, seen_frame, reason)
                 if stop_event.wait(2):
                     break
                 continue
+            ok, frame = _read_until_frame(capture, stop_event)
+            if not ok or frame is None:
+                capture.release()
+                misses += 1
+                reason = "" if seen_frame or misses < 3 else "Could not read the camera."
+                self._mark_reconnect(generation, seen_frame, reason)
+                if stop_event.wait(2):
+                    break
+                continue
+            misses = 0
+            seen_frame = True
             with self._lock:
                 if generation == self._generation:
                     self.running = True
@@ -398,13 +421,6 @@ class Engine:
             next_infer = 0.0
             infer_gap = 0.0 if device == "cuda" else 0.15
             while not stop_event.is_set() and generation == self._generation:
-                if seen_frame:
-                    ok, frame = capture.read()
-                else:
-                    (ok, frame), read_log = _with_ffmpeg_log(lambda: capture.read())
-                if not ok or frame is None:
-                    break
-                seen_frame = True
                 now = time.monotonic()
                 try:
                     if now >= next_infer:
@@ -414,11 +430,13 @@ class Engine:
                         self._publish_preview(frame, generation)
                 except Exception as exc:
                     print("frame error:", type(exc).__name__)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
             capture.release()
             if stop_event.is_set() or generation != self._generation:
                 break
-            reason = "" if seen_frame else rtsp_failure_message(f"{open_log}\n{read_log}")
-            self._mark_reconnect(generation, seen_frame, reason)
+            self._mark_reconnect(generation, seen_frame)
             if stop_event.wait(2):
                 break
         close_old_connections()
