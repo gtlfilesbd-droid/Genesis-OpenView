@@ -382,3 +382,41 @@ class FaceCaptureTests(TestCase):
         first = person.samples.order_by("created_at").first()
         stored = np.frombuffer(bytes(first.embedding), dtype=np.float32)
         self.assertGreater(float(np.dot(stored, front)), 0.99)
+
+    def test_snap_adds_to_existing_profile_without_changing_list(self):
+        import cv2
+        import numpy as np
+        from django.core.files.base import ContentFile
+
+        from camera.models import FaceCapture, Person
+        from camera.services.faces import to_bytes
+        from camera.services.gallery import add_sample
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        jpeg = encoded.tobytes()
+        front = self._vector(0)
+        person = Person(name="Ashraf", list_status=Person.WHITELIST, embedding=to_bytes(front))
+        person.photo.save("cover.jpg", ContentFile(jpeg), save=True)
+        self.assertTrue(add_sample(person, jpeg, front, "front.jpg"))
+        side = np.zeros(512, dtype=np.float32)
+        side[0] = 0.6
+        side[1] = 0.8
+        side /= np.linalg.norm(side)
+        capture = FaceCapture(
+            camera_number=1,
+            track_id=4,
+            embedding=to_bytes(side),
+            det_score=0.91,
+            quality=1.1,
+        )
+        capture.face_crop.save("snap.jpg", ContentFile(jpeg), save=True)
+        response = self.client.post(f"/recognition/{capture.pk}/sample/", {"person": person.pk})
+        self.assertEqual(response.status_code, 302)
+        person.refresh_from_db()
+        capture.refresh_from_db()
+        self.assertEqual(person.list_status, Person.WHITELIST)
+        self.assertEqual(person.samples.count(), 2)
+        self.assertEqual(capture.person_id, person.pk)
+        self.assertEqual(capture.matched_name, "Ashraf")

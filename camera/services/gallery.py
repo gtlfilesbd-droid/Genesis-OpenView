@@ -74,18 +74,26 @@ def _store_person_vector(person, updated: bytes) -> None:
     person.save(update_fields=["embedding"])
 
 
-def add_sample(person, photo_bytes: bytes, embedding, filename: str) -> bool:
-    """Store another angle unless it repeats a saved sample or the profile is full."""
+def sample_skip_reason(person, embedding) -> str:
+    """Return why this face cannot be stored: invalid, full, duplicate, or empty."""
     vector = current_vector(to_bytes(embedding))
-    if vector is None or not photo_bytes:
-        return False
+    if vector is None:
+        return "invalid"
     samples = list(person.samples.all())
     if len(samples) >= SAMPLE_LIMIT:
-        return False
+        return "full"
     for sample in samples:
         stored = current_vector(bytes(sample.embedding) if sample.embedding else None)
         if stored is not None and similarity(vector, stored) >= SAMPLE_SAME:
-            return False
+            return "duplicate"
+    return ""
+
+
+def add_sample(person, photo_bytes: bytes, embedding, filename: str) -> bool:
+    """Store another angle unless it repeats a saved sample or the profile is full."""
+    vector = current_vector(to_bytes(embedding))
+    if vector is None or not photo_bytes or sample_skip_reason(person, embedding):
+        return False
     sample = PersonSample(person=person, embedding=to_bytes(vector))
     sample.photo.save(filename, ContentFile(photo_bytes), save=False)
     sample.save()

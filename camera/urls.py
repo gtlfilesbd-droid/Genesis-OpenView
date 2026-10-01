@@ -13,6 +13,7 @@ urlpatterns = [
     path("alarms/", views.alarms, name="alarms"),
     path("recognition/", views.recognition, name="recognition"),
     path("recognition/<int:pk>/list/", views.capture_classify, name="capture_classify"),
+    path("recognition/<int:pk>/sample/", views.capture_sample, name="capture_sample"),
     path("people/", views.people, name="people"),
     path("people/<int:pk>/delete/", views.person_delete, name="person_delete"),
     path("people/<int:pk>/list/", views.person_list, name="person_list"),

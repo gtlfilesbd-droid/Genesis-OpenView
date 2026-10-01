@@ -180,7 +180,8 @@ def alarms(request):
 
 def recognition(request):
     captures = FaceCapture.objects.select_related("person")[:80]
-    return render(request, "camera/recognition.html", {"captures": captures})
+    people = Person.objects.order_by("name")
+    return render(request, "camera/recognition.html", {"captures": captures, "people": people})
 
 
 def _add_capture_sample(person, capture) -> None:
@@ -227,6 +228,42 @@ def capture_classify(request, pk):
         _add_capture_sample(person, other)
     engine._gallery_at = 0.0
     messages.success(request, f"{person.name} is on the {status}.")
+    return redirect("recognition")
+
+
+@require_POST
+def capture_sample(request, pk):
+    from .services.gallery import sample_skip_reason
+
+    capture = get_object_or_404(FaceCapture, pk=pk)
+    try:
+        person_id = int(request.POST.get("person") or "")
+    except ValueError:
+        person_id = 0
+    person = Person.objects.filter(pk=person_id).first()
+    if person is None:
+        messages.error(request, "Choose a person.")
+        return redirect("recognition")
+    vector = current_vector(bytes(capture.embedding) if capture.embedding else None)
+    payload = _read_field(capture.face_crop)
+    if vector is None or not payload:
+        messages.error(request, "This capture has no usable face photo.")
+        return redirect("recognition")
+    reason = sample_skip_reason(person, vector)
+    if reason == "duplicate":
+        messages.error(request, f"This photo is already on {person.name}'s profile.")
+        return redirect("recognition")
+    if reason == "full":
+        messages.error(request, f"{person.name} already has 12 sample photos.")
+        return redirect("recognition")
+    if reason or not add_sample(person, payload, vector, f"{capture.pk}.jpg"):
+        messages.error(request, "This snap was not added.")
+        return redirect("recognition")
+    capture.person = person
+    capture.matched_name = person.name
+    capture.save(update_fields=["person", "matched_name"])
+    engine._gallery_at = 0.0
+    messages.success(request, f"Added this snap to {person.name}.")
     return redirect("recognition")
 
 

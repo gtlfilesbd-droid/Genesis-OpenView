@@ -28,6 +28,20 @@
           <button class="danger" type="submit" name="list_status" value="blacklist">Blacklist</button>
         </div>
       </form>
+      {% if people %}
+      <form method="post" action="{% url 'capture_sample' capture.pk %}">
+        {% csrf_token %}
+        <label>Existing person
+          <select name="person" required>
+            <option value="">Choose</option>
+            {% for person in people %}
+              <option value="{{ person.pk }}">{{ person.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button class="ghost" type="submit">Add to profile</button>
+      </form>
+      {% endif %}
     </article>
     {% endfor %}
   </div>
