@@ -490,14 +490,12 @@ class Engine:
             return self._gallery
         from camera.models import Person
 
-        from .gallery import load_person_vector
+        from .gallery import load_person_vectors
 
         gallery = []
-        for person in Person.objects.all():
-            vector = load_person_vector(person)
-            if vector is None:
-                continue
-            gallery.append((person, vector))
+        for person in Person.objects.prefetch_related("samples"):
+            for vector in load_person_vectors(person):
+                gallery.append((person, vector))
         self._gallery = gallery
         self._gallery_at = time.monotonic()
         return gallery

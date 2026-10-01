@@ -182,6 +182,20 @@ class FaceQualityTests(TestCase):
         self.assertEqual(chosen, "Ashraf")
         self.assertGreater(score, 0.9)
 
+    def test_two_samples_of_one_person_still_match(self):
+        import numpy as np
+
+        from camera.services.faces import best_person
+
+        front = np.zeros(512, dtype=np.float32)
+        front[0] = 1
+        side = front.copy()
+        side[2] = 0.15
+        side /= np.linalg.norm(side)
+        chosen, score = best_person(front, [("Ashraf", front), ("Ashraf", side)])
+        self.assertEqual(chosen, "Ashraf")
+        self.assertGreater(score, 0.9)
+
     def test_front_face_yaw_is_near_zero(self):
         import numpy as np
 
@@ -296,7 +310,75 @@ class FaceCaptureTests(TestCase):
         self.assertEqual(capture.person_id, person.pk)
         self.assertEqual(twin.person_id, person.pk)
         self.assertEqual(twin.matched_name, "Ashraf")
+        self.assertEqual(person.samples.count(), 1)
         page = self.client.get("/recognition/")
         self.assertEqual(page.status_code, 200)
         self.assertContains(page, "Ashraf")
         self.assertContains(page, "blacklist")
+
+    def test_enroll_blacklist_can_switch_to_whitelist(self):
+        import cv2
+        import numpy as np
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from unittest.mock import patch
+
+        from camera.models import Person
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        upload = SimpleUploadedFile("ashraf.jpg", encoded.tobytes(), content_type="image/jpeg")
+        with patch("camera.views.embed_image", return_value=self._vector(0)):
+            response = self.client.post(
+                "/people/",
+                {"name": "Ashraf", "list_status": "blacklist", "photos": upload},
+            )
+        self.assertEqual(response.status_code, 302)
+        person = Person.objects.get()
+        self.assertEqual(person.list_status, Person.BLACKLIST)
+        self.assertEqual(person.samples.count(), 1)
+        response = self.client.post(f"/people/{person.pk}/list/", {"list_status": "whitelist"})
+        self.assertEqual(response.status_code, 302)
+        person.refresh_from_db()
+        self.assertEqual(person.list_status, Person.WHITELIST)
+
+    def test_recognition_adds_a_second_sample(self):
+        import cv2
+        import numpy as np
+        from django.core.files.base import ContentFile
+
+        from camera.models import FaceCapture, Person
+        from camera.services.faces import to_bytes
+        from camera.services.gallery import add_sample
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        jpeg = encoded.tobytes()
+        front = self._vector(0)
+        person = Person(name="Ashraf", list_status=Person.WHITELIST, embedding=to_bytes(front))
+        person.photo.save("cover.jpg", ContentFile(jpeg), save=True)
+        self.assertTrue(add_sample(person, jpeg, front, "front.jpg"))
+        side = np.zeros(512, dtype=np.float32)
+        side[0] = 0.6
+        side[1] = 0.8
+        side /= np.linalg.norm(side)
+        capture = FaceCapture(
+            camera_number=1,
+            track_id=3,
+            embedding=to_bytes(side),
+            det_score=0.9,
+            quality=1.2,
+        )
+        capture.face_crop.save("side.jpg", ContentFile(jpeg), save=True)
+        response = self.client.post(
+            f"/recognition/{capture.pk}/list/",
+            {"name": "Ashraf", "list_status": "blacklist"},
+        )
+        self.assertEqual(response.status_code, 302)
+        person.refresh_from_db()
+        self.assertEqual(person.list_status, Person.BLACKLIST)
+        self.assertEqual(person.samples.count(), 2)
+        first = person.samples.order_by("created_at").first()
+        stored = np.frombuffer(bytes(first.embedding), dtype=np.float32)
+        self.assertGreater(float(np.dot(stored, front)), 0.99)

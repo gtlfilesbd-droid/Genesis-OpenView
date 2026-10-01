@@ -26,6 +26,19 @@ class Person(models.Model):
         return self.name
 
 
+class PersonSample(models.Model):
+    person = models.ForeignKey(Person, related_name="samples", on_delete=models.CASCADE)
+    photo = models.ImageField(upload_to="people/samples/")
+    embedding = models.BinaryField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.person} sample"
+
+
 class Alarm(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     camera_number = models.PositiveIntegerField()

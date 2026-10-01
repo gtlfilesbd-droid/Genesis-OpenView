@@ -5,7 +5,13 @@
 <form method="post" enctype="multipart/form-data" class="panel">
   {% csrf_token %}
   <label>Name <input name="name" required></label>
-  <label>Front-facing photo <input type="file" name="photo" accept="image/*" required></label>
+  <label>List
+    <select name="list_status">
+      <option value="whitelist">Whitelist</option>
+      <option value="blacklist">Blacklist</option>
+    </select>
+  </label>
+  <label>Face photos, different angles <input type="file" name="photos" accept="image/*" multiple required></label>
   <button type="submit">Enroll</button>
 </form>
 <div class="cards" style="margin-top: 16px;">
@@ -14,6 +20,31 @@
       <img src="{{ person.photo.url }}" alt="{{ person.name }}">
       <p><strong>{{ person.name }}</strong> <span class="badge {{ person.list_status }}">{{ person.list_status }}</span></p>
       {% if person.needs_new_photo %}<p class="error">Needs a new front-facing photo.</p>{% endif %}
+      <div class="samples">
+        {% for sample in person.samples.all %}
+          <figure>
+            <img src="{{ sample.photo.url }}" alt="{{ person.name }} sample">
+            {% if person.samples.count > 1 %}
+            <form method="post" action="{% url 'sample_delete' person.pk sample.pk %}">
+              {% csrf_token %}
+              <button class="ghost" type="submit">Remove</button>
+            </form>
+            {% endif %}
+          </figure>
+        {% endfor %}
+      </div>
+      <form method="post" action="{% url 'person_samples' person.pk %}" enctype="multipart/form-data">
+        {% csrf_token %}
+        <label>More photos <input type="file" name="photos" accept="image/*" multiple required></label>
+        <button class="ghost" type="submit">Add photos</button>
+      </form>
+      <form method="post" action="{% url 'person_list' person.pk %}">
+        {% csrf_token %}
+        <div class="row">
+          <button type="submit" name="list_status" value="whitelist">Whitelist</button>
+          <button class="danger" type="submit" name="list_status" value="blacklist">Blacklist</button>
+        </div>
+      </form>
       <form method="post" action="{% url 'person_delete' person.pk %}">
         {% csrf_token %}
         <button class="ghost" type="submit">Remove</button>

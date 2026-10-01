@@ -7,7 +7,7 @@ from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .models import Alarm, FaceCapture, Person, Zone
+from .models import Alarm, FaceCapture, Person, PersonSample, Zone
 from .services.engine import engine, grab_jpeg
 from .services.faces import (
     MATCH_THRESHOLD,
@@ -17,7 +17,7 @@ from .services.faces import (
     similarity,
     to_bytes,
 )
-from .services.gallery import load_person_vector
+from .services.gallery import add_sample, load_person_vector, load_person_vectors
 
 
 def _camera_number(value, default: int) -> int:
@@ -51,6 +51,22 @@ def _clean_points(raw):
 
 def _stream_name(value, default: str) -> str:
     return value if value in ("sub", "main") else default
+
+
+def _read_field(field) -> bytes:
+    if not field:
+        return b""
+    field.open("rb")
+    try:
+        return field.read()
+    finally:
+        field.close()
+
+
+def _list_status(value: str) -> str:
+    if value in (Person.WHITELIST, Person.BLACKLIST):
+        return value
+    return ""
 
 
 def live(request):
@@ -167,76 +183,90 @@ def recognition(request):
     return render(request, "camera/recognition.html", {"captures": captures})
 
 
+def _add_capture_sample(person, capture) -> None:
+    vector = current_vector(bytes(capture.embedding) if capture.embedding else None)
+    payload = _read_field(capture.face_crop)
+    if vector is None or not payload:
+        return
+    add_sample(person, payload, vector, f"{capture.pk}.jpg")
+
+
 @require_POST
 def capture_classify(request, pk):
     from .services.captures import link_same_face
 
     capture = get_object_or_404(FaceCapture, pk=pk)
     name = (request.POST.get("name") or "").strip()
-    status = request.POST.get("list_status") or ""
-    if status not in (Person.WHITELIST, Person.BLACKLIST) or not name:
+    status = _list_status(request.POST.get("list_status") or "")
+    if not status or not name:
         messages.error(request, "Enter a name and choose whitelist or blacklist.")
         return redirect("recognition")
-    if current_vector(bytes(capture.embedding) if capture.embedding else None) is None:
+    vector = current_vector(bytes(capture.embedding) if capture.embedding else None)
+    if vector is None:
         messages.error(request, "This capture has no usable face vector.")
         return redirect("recognition")
-    payload = b""
-    if capture.face_crop:
-        capture.face_crop.open("rb")
-        try:
-            payload = capture.face_crop.read()
-        finally:
-            capture.face_crop.close()
-    if capture.person_id:
-        person = capture.person
-        person.name = name
-        person.list_status = status
-        person.embedding = bytes(capture.embedding)
-        if payload:
-            person.photo.save(f"{capture.pk}.jpg", ContentFile(payload), save=False)
-        person.save()
-    else:
+    payload = _read_field(capture.face_crop)
+    person = Person.objects.filter(name__iexact=name).first()
+    if person is None:
         if not payload:
             messages.error(request, "This capture has no face photo.")
             return redirect("recognition")
-        person = Person(name=name, list_status=status, embedding=bytes(capture.embedding))
+        person = Person(name=name, list_status=status, embedding=to_bytes(vector))
         person.photo.save(f"{capture.pk}.jpg", ContentFile(payload), save=False)
         person.save()
+    else:
+        person.name = name
+        person.list_status = status
+        person.save(update_fields=["name", "list_status"])
+    _add_capture_sample(person, capture)
     capture.person = person
-    capture.matched_name = name
+    capture.matched_name = person.name
     capture.save(update_fields=["person", "matched_name"])
     link_same_face(capture, person)
+    for other in FaceCapture.objects.filter(person=person).exclude(pk=capture.pk):
+        _add_capture_sample(person, other)
     engine._gallery_at = 0.0
-    messages.success(request, f"{name} is on the {status}.")
+    messages.success(request, f"{person.name} is on the {status}.")
     return redirect("recognition")
+
+
+def _embed_upload(upload):
+    payload = upload.read()
+    image = decode_image_bytes(payload)
+    try:
+        embedding = embed_image(image) if image is not None else None
+    except Exception:
+        embedding = None
+    if embedding is None:
+        return None
+    return payload, embedding
 
 
 def people(request):
     if request.method == "POST":
         name = (request.POST.get("name") or "").strip()
-        upload = request.FILES.get("photo")
-        if not name or upload is None:
-            messages.error(request, "Enter a name and choose a clear face photo.")
+        status = _list_status(request.POST.get("list_status") or "") or Person.WHITELIST
+        uploads = request.FILES.getlist("photos")
+        if not name or not uploads:
+            messages.error(request, "Enter a name and choose at least one face photo.")
         else:
-            payload = upload.read()
-            image = decode_image_bytes(payload)
-            try:
-                embedding = embed_image(image) if image is not None else None
-            except Exception:
-                embedding = None
-            if embedding is None:
-                messages.error(request, "No face found. Use a front-facing photo.")
+            person = None
+            for upload in uploads:
+                found = _embed_upload(upload)
+                if found is None:
+                    continue
+                payload, embedding = found
+                if person is None:
+                    person = Person(name=name, embedding=to_bytes(embedding), list_status=status)
+                    person.photo.save(upload.name or "face.jpg", ContentFile(payload), save=False)
+                    person.save()
+                add_sample(person, payload, embedding, upload.name or f"{person.pk}.jpg")
+            if person is None:
+                messages.error(request, "No face found. Use front-facing photos.")
             else:
-                person = Person(
-                    name=name,
-                    embedding=to_bytes(embedding),
-                    list_status=Person.WHITELIST,
-                )
-                person.photo.save(upload.name, ContentFile(payload), save=False)
-                person.save()
-                messages.success(request, f"Enrolled {name}.")
+                messages.success(request, f"Enrolled {name} on the {status}.")
                 return redirect("people")
-    enrolled = list(Person.objects.order_by("-created_at"))
+    enrolled = list(Person.objects.prefetch_related("samples").order_by("-created_at"))
     for person in enrolled:
         person.needs_new_photo = load_person_vector(person) is None
     return render(request, "camera/people.html", {"people": enrolled})
@@ -245,6 +275,58 @@ def people(request):
 @require_POST
 def person_delete(request, pk):
     get_object_or_404(Person, pk=pk).delete()
+    return redirect("people")
+
+
+@require_POST
+def person_list(request, pk):
+    person = get_object_or_404(Person, pk=pk)
+    status = _list_status(request.POST.get("list_status") or "")
+    if not status:
+        messages.error(request, "Choose whitelist or blacklist.")
+    else:
+        person.list_status = status
+        person.save(update_fields=["list_status"])
+        engine._gallery_at = 0.0
+        messages.success(request, f"{person.name} is on the {status}.")
+    return redirect("people")
+
+
+@require_POST
+def person_samples(request, pk):
+    person = get_object_or_404(Person, pk=pk)
+    added = 0
+    for upload in request.FILES.getlist("photos"):
+        found = _embed_upload(upload)
+        if found is None:
+            continue
+        payload, embedding = found
+        if add_sample(person, payload, embedding, upload.name or f"{person.pk}.jpg"):
+            added += 1
+    if added:
+        engine._gallery_at = 0.0
+        messages.success(request, f"Added {added} photo{'s' if added != 1 else ''} to {person.name}.")
+    else:
+        messages.error(request, "No new face photo was added.")
+    return redirect("people")
+
+
+@require_POST
+def sample_delete(request, pk, sample_pk):
+    person = get_object_or_404(Person, pk=pk)
+    sample = get_object_or_404(PersonSample, pk=sample_pk, person=person)
+    if person.samples.count() <= 1:
+        messages.error(request, "Keep at least one sample photo.")
+        return redirect("people")
+    sample.delete()
+    remaining = person.samples.order_by("created_at").first()
+    if remaining is not None:
+        payload = _read_field(remaining.photo)
+        if payload:
+            person.photo.save(f"cover-{person.pk}.jpg", ContentFile(payload), save=False)
+        person.embedding = bytes(remaining.embedding)
+        person.save()
+    engine._gallery_at = 0.0
     return redirect("people")
 
 
@@ -265,11 +347,11 @@ def search(request):
                 error = "No face found in that photo."
             else:
                 people_scores = []
-                for person in Person.objects.all():
-                    stored = load_person_vector(person)
-                    if stored is None:
+                for person in Person.objects.prefetch_related("samples"):
+                    stored_vectors = load_person_vectors(person)
+                    if not stored_vectors:
                         continue
-                    score = similarity(embedding, stored)
+                    score = max(similarity(embedding, stored) for stored in stored_vectors)
                     people_scores.append(
                         {"person": person, "score": score, "match": score >= MATCH_THRESHOLD}
                     )

@@ -15,5 +15,8 @@ urlpatterns = [
     path("recognition/<int:pk>/list/", views.capture_classify, name="capture_classify"),
     path("people/", views.people, name="people"),
     path("people/<int:pk>/delete/", views.person_delete, name="person_delete"),
+    path("people/<int:pk>/list/", views.person_list, name="person_list"),
+    path("people/<int:pk>/samples/", views.person_samples, name="person_samples"),
+    path("people/<int:pk>/samples/<int:sample_pk>/delete/", views.sample_delete, name="sample_delete"),
     path("search/", views.search, name="search"),
 ]

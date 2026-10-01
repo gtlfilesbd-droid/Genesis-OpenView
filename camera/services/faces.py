@@ -22,6 +22,8 @@ SAVE_MAX_YAW = 30.0
 MIN_BLUR = 45.0
 BLACKLIST_THRESHOLD = 0.52
 DEDUP_SIMILARITY = 0.55
+SAMPLE_SAME = 0.92
+SAMPLE_LIMIT = 12
 LIVE_DET_SIZE = (320, 320)
 ENROLL_DET_SIZE = (640, 640)
 _ORT_THREADS = 2
@@ -358,23 +360,43 @@ def similarity(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.dot(first, second))
 
 
-def best_match(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> tuple[str, float]:
+def _identity(label):
+    pk = getattr(label, "pk", None)
+    if pk is not None:
+        return ("id", pk)
+    return ("value", label)
+
+
+def _best_by_identity(embedding: np.ndarray, gallery: list[tuple]) -> list[tuple[float, object]]:
+    """Keep each person's best sample, then rank people."""
     query = np.asarray(embedding, dtype=np.float32).reshape(-1)
-    scored: list[tuple[float, str]] = []
-    for name, stored in gallery:
+    best: dict = {}
+    for label, stored in gallery:
         vector = np.asarray(stored, dtype=np.float32).reshape(-1)
         if vector.size != query.size or vector.size != EMBED_DIM:
             continue
-        scored.append((similarity(query, vector), name))
-    if not scored:
-        return "", 0.0
-    scored.sort(key=lambda item: item[0], reverse=True)
-    best_score, chosen = scored[0]
+        score = similarity(query, vector)
+        key = _identity(label)
+        current = best.get(key)
+        if current is None or score > current[0]:
+            best[key] = (score, label)
+    return sorted(best.values(), key=lambda item: item[0], reverse=True)
+
+
+def _choose(ranked: list[tuple[float, object]]) -> tuple[object | None, float]:
+    if not ranked:
+        return None, 0.0
+    best_score, chosen = ranked[0]
     if best_score < MATCH_THRESHOLD:
-        return "", best_score
-    if len(scored) > 1 and best_score - scored[1][0] < MATCH_MARGIN:
-        return "", best_score
+        return None, best_score
+    if len(ranked) > 1 and best_score - ranked[1][0] < MATCH_MARGIN:
+        return None, best_score
     return chosen, best_score
+
+
+def best_match(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> tuple[str, float]:
+    chosen, score = _choose(_best_by_identity(embedding, gallery))
+    return (chosen or ""), score
 
 
 def best_name(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> str:
@@ -383,23 +405,8 @@ def best_name(embedding: np.ndarray, gallery: list[tuple[str, np.ndarray]]) -> s
 
 
 def best_person(embedding: np.ndarray, gallery: list[tuple]) -> tuple[object | None, float]:
-    """Pick a person the same way as best_match. A close second name is rejected."""
-    query = np.asarray(embedding, dtype=np.float32).reshape(-1)
-    scored: list[tuple[float, object]] = []
-    for person, stored in gallery:
-        vector = np.asarray(stored, dtype=np.float32).reshape(-1)
-        if vector.size != query.size or vector.size != EMBED_DIM:
-            continue
-        scored.append((similarity(query, vector), person))
-    if not scored:
-        return None, 0.0
-    scored.sort(key=lambda item: item[0], reverse=True)
-    best_score, chosen = scored[0]
-    if best_score < MATCH_THRESHOLD:
-        return None, best_score
-    if len(scored) > 1 and best_score - scored[1][0] < MATCH_MARGIN:
-        return None, best_score
-    return chosen, best_score
+    """Pick a person by their best sample. A close second person is rejected."""
+    return _choose(_best_by_identity(embedding, gallery))
 
 
 def next_identity(
