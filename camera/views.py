@@ -9,8 +9,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from .models import Alarm, FaceCapture, Nvr, Person, PersonSample, Zone
-from .services.rtsp import env_nvr_fields
-from .services.engine import engine, grab_jpeg
+from .services.rtsp import env_nvr_fields, stream_url
+from .services.engine import engine, grab_jpeg, probe_stream
 from .services.faces import (
     MATCH_THRESHOLD,
     current_vector,
@@ -407,12 +407,20 @@ def settings(request):
                     nvr.password = password
                 nvr.save()
                 Nvr.objects.exclude(pk=nvr.pk).delete()
-            messages.success(request, "NVR saved.")
+            try:
+                probe_url, _channel = stream_url(1, "sub")
+                reason = probe_stream(probe_url)
+            except Exception:
+                reason = "Could not read the camera."
+            if reason:
+                messages.error(request, f"NVR saved, but the camera did not open. {reason}")
+            else:
+                messages.success(request, "NVR saved.")
             if engine.running or engine.starting:
                 engine.start(engine.camera_number, engine.stream)
             else:
                 with engine._lock:
-                    engine.error = ""
+                    engine.error = reason
             return redirect("settings")
     return render(
         request,

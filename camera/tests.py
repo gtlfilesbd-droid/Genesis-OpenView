@@ -160,30 +160,80 @@ class NvrSettingsTests(TestCase):
         self.assertNotContains(response, "Leave the password blank")
 
     def test_settings_saves_and_keeps_password_when_blank(self):
+        from unittest.mock import patch
+
         from camera.models import Nvr
 
-        created = self.client.post(
-            "/settings/",
-            {"host": "192.168.1.20", "username": "admin", "password": "pass@word"},
-        )
+        with patch("camera.views.probe_stream", return_value=""):
+            created = self.client.post(
+                "/settings/",
+                {"host": "192.168.1.20", "username": "admin", "password": "pass@word"},
+            )
         self.assertEqual(created.status_code, 302)
         nvr = Nvr.objects.get()
         self.assertEqual((nvr.host, nvr.username, nvr.password), ("192.168.1.20", "admin", "pass@word"))
 
-        updated = self.client.post(
-            "/settings/",
-            {"host": "192.168.68.80", "username": "operator", "password": ""},
-        )
+        with patch("camera.views.probe_stream", return_value=""):
+            updated = self.client.post(
+                "/settings/",
+                {"host": "192.168.68.80", "username": "operator", "password": ""},
+            )
         self.assertEqual(updated.status_code, 302)
         nvr.refresh_from_db()
         self.assertEqual((nvr.host, nvr.username, nvr.password), ("192.168.68.80", "operator", "pass@word"))
         self.assertEqual(Nvr.objects.count(), 1)
 
         page = self.client.get("/settings/")
+        self.assertContains(page, "NVR saved.")
         self.assertNotContains(page, "Leave the password blank")
         self.assertContains(page, 'value="192.168.68.80"')
         self.assertContains(page, 'type="password"')
         self.assertContains(page, 'value="pass@word"')
+
+    def test_settings_save_reports_probe_failure(self):
+        from unittest.mock import patch
+
+        from camera.models import Nvr
+
+        with patch("camera.views.probe_stream", return_value="NVR login was rejected."):
+            response = self.client.post(
+                "/settings/",
+                {"host": "10.0.0.8", "username": "admin", "password": "secret"},
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Nvr.objects.get().host, "10.0.0.8")
+        page = self.client.get("/settings/")
+        self.assertContains(page, "NVR saved, but the camera did not open.")
+        self.assertContains(page, "NVR login was rejected.")
+
+    def test_rtsp_failure_hides_the_password(self):
+        import os
+
+        from camera.services.engine import rtsp_failure_message
+
+        self.assertEqual(
+            rtsp_failure_message("[rtsp @ 1] method DESCRIBE failed: 401 Unauthorized"),
+            "NVR login was rejected.",
+        )
+        self.assertEqual(rtsp_failure_message("Connection timed out"), "The NVR did not answer.")
+        self.assertEqual(rtsp_failure_message("Connection refused"), "Could not reach the NVR.")
+        hidden = rtsp_failure_message("open rtsp://admin:secret@10.0.0.1:554/Streaming/Channels/102")
+        self.assertNotIn("secret", hidden)
+        self.assertEqual(rtsp_failure_message(""), "Could not read the camera.")
+        self.assertIn("rtsp_transport;tcp", os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"])
+
+    def test_ffmpeg_stderr_is_captured(self):
+        import os
+
+        from camera.services.engine import _with_ffmpeg_log
+
+        def write():
+            os.write(2, b"method DESCRIBE failed: 401 Unauthorized\n")
+            return "opened"
+
+        result, log = _with_ffmpeg_log(write)
+        self.assertEqual(result, "opened")
+        self.assertIn("401 Unauthorized", log)
 
     def test_settings_rejects_bad_ip_and_missing_first_password(self):
         from camera.models import Nvr

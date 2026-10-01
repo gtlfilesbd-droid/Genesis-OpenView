@@ -1,6 +1,12 @@
 import os
+import re
 import threading
 import time
+
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;8000000",
+)
 
 import cv2
 import numpy as np
@@ -12,7 +18,8 @@ from .dwell import DwellTracker
 from .geom import point_in_polygon
 from .rtsp import ROOT, base_rtsp_url, parse_channel, stream_url
 
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;8000000")
+_stderr_lock = threading.Lock()
+_RTSP_SECRET = re.compile(r"rtsp://\S+", re.IGNORECASE)
 
 
 def _placeholder(text: str) -> bytes:
@@ -83,9 +90,91 @@ def _draw_zone(image, points) -> None:
 
 
 def _open_capture(url: str) -> cv2.VideoCapture:
-    capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    capture = cv2.VideoCapture()
+    capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
+    capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    capture.open(url, cv2.CAP_FFMPEG)
     return capture
+
+
+def _with_ffmpeg_log(fn):
+    """Run fn while collecting C-level stderr. ffmpeg does not use sys.stderr."""
+    with _stderr_lock:
+        read_fd, write_fd = os.pipe()
+        saved = os.dup(2)
+        chunks: list[bytes] = []
+
+        def _read() -> None:
+            try:
+                while True:
+                    data = os.read(read_fd, 4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            except OSError:
+                pass
+
+        reader = threading.Thread(target=_read, daemon=True)
+        reader.start()
+        spare_write = write_fd
+        try:
+            os.dup2(write_fd, 2)
+            os.close(write_fd)
+            spare_write = -1
+            result = fn()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+            if spare_write != -1:
+                os.close(spare_write)
+            reader.join(timeout=1)
+            os.close(read_fd)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return result, text
+
+
+def rtsp_failure_message(log: str) -> str:
+    """Short reason for the Live page. Never includes the RTSP password."""
+    redacted = _RTSP_SECRET.sub("rtsp://nvr", log or "")
+    lowered = redacted.lower()
+    if "401" in lowered or "unauthorized" in lowered or "403" in lowered:
+        return "NVR login was rejected."
+    if "timed out" in lowered or "timeout" in lowered:
+        return "The NVR did not answer."
+    if any(
+        phrase in lowered
+        for phrase in (
+            "connection refused",
+            "no route",
+            "unreachable",
+            "could not connect",
+            "failed to resolve",
+            "name or service not known",
+        )
+    ):
+        return "Could not reach the NVR."
+    lines = [line.strip() for line in redacted.splitlines() if line.strip()]
+    if not lines:
+        return "Could not read the camera."
+    last = lines[-1]
+    if len(last) > 140:
+        last = last[:137] + "..."
+    return last
+
+
+def probe_stream(url: str) -> str:
+    """Return '' when one frame arrives, otherwise a short public error."""
+    capture, log = _with_ffmpeg_log(lambda: _open_capture(url))
+    try:
+        if not capture.isOpened():
+            return rtsp_failure_message(log)
+        (ok, frame), read_log = _with_ffmpeg_log(lambda: capture.read())
+        if not ok or frame is None:
+            return rtsp_failure_message(f"{log}\n{read_log}")
+        return ""
+    finally:
+        capture.release()
 
 
 class Engine:
@@ -293,10 +382,11 @@ class Engine:
             return
         seen_frame = False
         while not stop_event.is_set() and generation == self._generation:
-            capture = _open_capture(url)
+            capture, open_log = _with_ffmpeg_log(lambda: _open_capture(url))
+            read_log = ""
             if not capture.isOpened():
                 capture.release()
-                self._mark_reconnect(generation, seen_frame)
+                self._mark_reconnect(generation, seen_frame, rtsp_failure_message(open_log))
                 if stop_event.wait(2):
                     break
                 continue
@@ -308,7 +398,10 @@ class Engine:
             next_infer = 0.0
             infer_gap = 0.0 if device == "cuda" else 0.15
             while not stop_event.is_set() and generation == self._generation:
-                ok, frame = capture.read()
+                if seen_frame:
+                    ok, frame = capture.read()
+                else:
+                    (ok, frame), read_log = _with_ffmpeg_log(lambda: capture.read())
                 if not ok or frame is None:
                     break
                 seen_frame = True
@@ -324,7 +417,8 @@ class Engine:
             capture.release()
             if stop_event.is_set() or generation != self._generation:
                 break
-            self._mark_reconnect(generation, seen_frame)
+            reason = "" if seen_frame else rtsp_failure_message(f"{open_log}\n{read_log}")
+            self._mark_reconnect(generation, seen_frame, reason)
             if stop_event.wait(2):
                 break
         close_old_connections()
@@ -333,13 +427,13 @@ class Engine:
                 self.running = False
                 self.starting = False
 
-    def _mark_reconnect(self, generation: int, seen_frame: bool) -> None:
+    def _mark_reconnect(self, generation: int, seen_frame: bool, reason: str = "") -> None:
         with self._lock:
             if generation == self._generation:
                 self.running = False
                 self.starting = True
                 if not seen_frame:
-                    self.error = "Could not read the camera."
+                    self.error = reason or "Could not read the camera."
 
     def _fail(self, generation: int, message: str) -> None:
         with self._lock:
@@ -775,7 +869,7 @@ def grab_jpeg(camera_number: int, stream: str) -> bytes:
         url, _channel = stream_url(camera_number, stream)
     except Exception:
         return b""
-    capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    capture = _open_capture(url)
     ok, frame = False, None
     if capture.isOpened():
         ok, frame = capture.read()
