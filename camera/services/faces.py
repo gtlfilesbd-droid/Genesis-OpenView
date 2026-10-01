@@ -14,8 +14,8 @@ MATCH_MARGIN = 0.08
 MIN_DET_SCORE = 0.5
 # Live labels can use a slightly softer face. Saving a capture is stricter.
 LABEL_DET_SCORE = 0.55
-LABEL_MIN_WIDTH = 48
-LABEL_MAX_YAW = 40.0
+LABEL_MIN_WIDTH = 32
+LABEL_MAX_YAW = 160.0
 SAVE_DET_SCORE = 0.62
 SAVE_MIN_WIDTH = 64
 SAVE_MAX_YAW = 30.0
@@ -202,7 +202,7 @@ def take_head(frame: np.ndarray, coords):
 
 
 def embed_head(crop: np.ndarray, origin, frame_shape) -> FaceHit | None:
-    """Detect on a head crop at 320. ArcFace runs only when the face is clear."""
+    """Detect on a head crop at 320. A turned face can still be named; only a clear face is saved."""
     detected = _detect(crop, LIVE_DET_SIZE)
     if detected is None:
         return None
@@ -215,7 +215,7 @@ def embed_head(crop: np.ndarray, origin, frame_shape) -> FaceHit | None:
     yaw = yaw_from_kps(kps)
     det_score = float(bbox[4])
     label_ok, save_ok, quality = assess_face(det_score, width, blur, yaw)
-    if not save_ok:
+    if not label_ok:
         return None
     embedding = _recognize(crop, bbox, kps)
     if embedding is None:
@@ -227,8 +227,8 @@ def embed_head(crop: np.ndarray, origin, frame_shape) -> FaceHit | None:
         yaw=yaw,
         blur=blur,
         quality=quality,
-        save_ok=True,
-        label_ok=label_ok,
+        save_ok=save_ok,
+        label_ok=True,
         photo=photo,
     )
 

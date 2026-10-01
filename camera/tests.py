@@ -156,6 +156,18 @@ class FaceQualityTests(TestCase):
         self.assertFalse(assess_face(0.9, 100, 10, 0)[1])
         self.assertFalse(assess_face(0.9, 100, 120, 45)[1])
 
+    def test_side_face_is_labeled_but_not_saved(self):
+        from camera.services.faces import assess_face
+
+        label_ok, save_ok, quality = assess_face(0.9, 40, 120, 135)
+        self.assertTrue(label_ok)
+        self.assertFalse(save_ok)
+        self.assertEqual(quality, 0)
+        label_ok, save_ok, quality = assess_face(0.9, 100, 120, 170)
+        self.assertFalse(label_ok)
+        self.assertFalse(save_ok)
+        self.assertEqual(quality, 0)
+
     def test_blacklist_alarm_needs_a_stronger_score(self):
         from camera.services.faces import blacklist_alarm_ready
 

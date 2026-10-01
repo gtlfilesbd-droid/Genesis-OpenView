@@ -389,6 +389,7 @@ class Engine:
             results = model.track(
                 frame,
                 persist=True,
+                tracker="bytetrack.yaml",
                 classes=class_ids,
                 imgsz=imgsz,
                 conf=0.30,
@@ -576,7 +577,7 @@ class Engine:
         from .faces import best_person, blacklist_alarm_ready, embed_head, next_identity
 
         found = embed_head(crop, origin, shape)
-        if found is None or not found.save_ok:
+        if found is None:
             return
         people = self._gallery_people()
         name = ""
