@@ -186,7 +186,9 @@ def analytics(request):
                 max_people = 5
             max_people = min(500, max(1, max_people))
             coverage = request.POST.get("coverage", AnalyticsRule.TOUCH)
-            if coverage not in dict(AnalyticsRule.COVERAGE):
+            if kind in (AnalyticsRule.OBJECT_IN, AnalyticsRule.OBJECT_REMOVED):
+                coverage = AnalyticsRule.TOUCH
+            elif coverage not in dict(AnalyticsRule.COVERAGE):
                 coverage = AnalyticsRule.TOUCH
             AnalyticsRule.objects.update_or_create(
                 camera_number=camera,
@@ -220,7 +222,7 @@ def analytics(request):
             "needs_duration": kind in DURATION_KINDS,
             "needs_people": kind == AnalyticsRule.CROWD,
             "is_line": kind == AnalyticsRule.LINE_CROSS,
-            "needs_coverage": kind != AnalyticsRule.LINE_CROSS,
+            "needs_coverage": kind in (AnalyticsRule.ZONE, AnalyticsRule.PEOPLE_COUNT, AnalyticsRule.CROWD),
             "coverage": saved.coverage if saved else AnalyticsRule.TOUCH,
             "coverages": [{"id": key, "label": label} for key, label in AnalyticsRule.COVERAGE],
             "direction": saved.direction if saved else AnalyticsRule.ANY,

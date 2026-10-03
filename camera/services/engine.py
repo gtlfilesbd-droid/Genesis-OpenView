@@ -777,7 +777,6 @@ class Engine:
                     rule.duration_seconds,
                     rule.kind == "object_in",
                     rule.kind == "object_removed",
-                    getattr(rule, "coverage", "touch"),
                 )
             )
             extra = {"red": monitor.showing_red(now)}
