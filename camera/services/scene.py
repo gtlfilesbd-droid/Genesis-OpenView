@@ -2,14 +2,15 @@ import cv2
 import numpy as np
 
 MIN_AREA_RATIO = 0.004
-MAX_AREA_RATIO = 0.45
-LIGHT_RATIO = 0.60
+MAX_AREA_RATIO = 0.85
+LIGHT_RATIO = 0.92
 DIFF_THRESH = 28
-CENTER_TOLERANCE = 0.02
-PERSON_GROW = 0.18
+CENTER_TOLERANCE = 0.05
+PERSON_GROW = 0.08
+PERSON_MASK_CONF = 0.55
 SCENE_LONG_SIDE = 480
 RED_HOLD = 8.0
-MISS_LIMIT = 3
+MISS_LIMIT = 6
 
 
 def polygon_mask(height: int, width: int, points) -> np.ndarray:
@@ -61,35 +62,29 @@ def is_global_change(changed: np.ndarray, mask: np.ndarray) -> bool:
     return int(np.count_nonzero(changed)) / roi >= LIGHT_RATIO
 
 
-def edge_energy(gray: np.ndarray, blob: np.ndarray) -> float:
-    edges = cv2.Canny(gray, 40, 120)
-    pixels = int(np.count_nonzero(blob))
-    if pixels == 0:
-        return 0.0
-    return float(np.count_nonzero((edges > 0) & (blob > 0))) / pixels
+def _same_spot(origin, center) -> bool:
+    return (center[0] - origin[0]) ** 2 + (center[1] - origin[1]) ** 2 <= CENTER_TOLERANCE**2
 
 
 def local_blobs(current: np.ndarray, reference: np.ndarray, mask: np.ndarray):
     changed = changed_mask(current, reference, mask)
     if is_global_change(changed, mask):
         return [], True
+    height, width = current.shape[:2]
     roi = max(1, int(np.count_nonzero(mask)))
+    floor = MIN_AREA_RATIO * height * width
+    ceiling = MAX_AREA_RATIO * roi
     found = []
     contours, _hierarchy = cv2.findContours(changed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    height, width = current.shape[:2]
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < MIN_AREA_RATIO * roi or area > MAX_AREA_RATIO * roi:
+        if area < floor or area > ceiling:
             continue
         moments = cv2.moments(contour)
         if moments["m00"] == 0:
             continue
         center = (moments["m10"] / moments["m00"] / width, moments["m01"] / moments["m00"] / height)
-        blob = np.zeros_like(mask)
-        cv2.drawContours(blob, [contour], -1, 255, -1)
-        current_edges = edge_energy(current, blob)
-        reference_edges = edge_energy(reference, blob)
-        found.append({"center": center, "area": area, "added": current_edges >= reference_edges})
+        found.append({"center": center, "area": area})
     return found, False
 
 
@@ -114,8 +109,9 @@ def _fit_scene(frame, person_boxes):
 class FieldMonitor:
     """Stationary object appear and disappear inside a polygon.
 
-    The clock starts when the changed spot stays put. A whole-region brightness
-    jump is a light change and does not alarm. People boxes are ignored.
+    Each still spot keeps its own clock. A larger change elsewhere in the zone
+    can move without resetting that clock. A brightness jump across the zone is
+    a light change and does not alarm. People boxes are ignored.
     """
 
     def __init__(self) -> None:
@@ -125,10 +121,12 @@ class FieldMonitor:
         self.in_since = None
         self.in_alarmed = False
         self.in_misses = 0
+        self.in_tracks = []
         self.out_center = None
         self.out_since = None
         self.out_alarmed = False
         self.out_misses = 0
+        self.out_tracks = []
         self.elapsed = 0.0
         self.watching = False
         self.red_until = 0.0
@@ -154,8 +152,8 @@ class FieldMonitor:
         if self.long_term is None or self.long_term.shape != gray.shape:
             self.long_term = gray.copy()
             self.armed = gray.copy()
-            self.elapsed = 0.0
-            self.watching = False
+            self._clear("in")
+            self._clear("out")
             return []
         alarms = []
         if want_in:
@@ -170,10 +168,9 @@ class FieldMonitor:
             self.long_term[mask > 0] = gray[mask > 0]
             self._clear("in")
             return []
-        added = [blob for blob in blobs if blob["added"]]
         quiet = (cv2.absdiff(gray, self.long_term) < 12) & (mask > 0)
         self.long_term[quiet] = gray[quiet]
-        return self._track("in", added, now, duration, "object_in")
+        return self._track("in", blobs, now, duration, "object_in")
 
     def _removed(self, gray, mask, now, duration):
         blobs, global_light = local_blobs(gray, self.armed, mask)
@@ -181,48 +178,56 @@ class FieldMonitor:
             self.armed[mask > 0] = gray[mask > 0]
             self._clear("out")
             return []
-        missing = [blob for blob in blobs if not blob["added"]]
-        return self._track("out", missing, now, duration, "object_removed")
+        return self._track("out", blobs, now, duration, "object_removed")
 
     def _track(self, which: str, blobs, now: float, duration: float, kind: str):
-        center_name = f"{which}_center"
-        since_name = f"{which}_since"
-        alarm_name = f"{which}_alarmed"
-        miss_name = f"{which}_misses"
-        if not blobs:
-            misses = getattr(self, miss_name) + 1
-            setattr(self, miss_name, misses)
-            if misses >= MISS_LIMIT:
-                self._clear(which)
-            elif getattr(self, since_name) is not None:
-                self.elapsed = max(0.0, now - getattr(self, since_name))
-                self.watching = True
+        tracks = getattr(self, f"{which}_tracks")
+        used = set()
+        for track in tracks:
+            match_at = None
+            for index, blob in enumerate(blobs):
+                if index in used or not _same_spot(track["center"], blob["center"]):
+                    continue
+                if match_at is None or blob["area"] > blobs[match_at]["area"]:
+                    match_at = index
+            if match_at is None:
+                track["misses"] += 1
+            else:
+                used.add(match_at)
+                track["misses"] = 0
+        for index, blob in enumerate(blobs):
+            if index not in used:
+                tracks.append({"center": blob["center"], "since": now, "alarmed": False, "misses": 0})
+        kept = [track for track in tracks if track["misses"] < MISS_LIMIT]
+        tracks[:] = kept
+        if not tracks:
+            self._clear(which)
             return []
-        setattr(self, miss_name, 0)
-        blob = max(blobs, key=lambda item: item["area"])
-        center = blob["center"]
-        previous = getattr(self, center_name)
-        if previous is None or (center[0] - previous[0]) ** 2 + (center[1] - previous[1]) ** 2 > CENTER_TOLERANCE**2:
-            setattr(self, center_name, center)
-            setattr(self, since_name, now)
-            setattr(self, alarm_name, False)
-            self.elapsed = 0.0
-            self.watching = True
-            return []
-        self.elapsed = max(0.0, now - getattr(self, since_name))
+        lead = max(tracks, key=lambda track: now - track["since"])
+        self.elapsed = max(0.0, now - lead["since"])
         self.watching = True
-        if getattr(self, alarm_name):
+        setattr(self, f"{which}_center", lead["center"])
+        setattr(self, f"{which}_since", lead["since"])
+        setattr(self, f"{which}_alarmed", lead["alarmed"])
+        setattr(self, f"{which}_misses", lead["misses"])
+        ready = [
+            track
+            for track in tracks
+            if not track["alarmed"] and track["misses"] == 0 and now - track["since"] >= duration
+        ]
+        if not ready:
             return []
-        if self.elapsed >= duration:
-            setattr(self, alarm_name, True)
-            self.red_until = now + RED_HOLD
-            return [kind]
-        return []
+        for track in ready:
+            track["alarmed"] = True
+        setattr(self, f"{which}_alarmed", True)
+        self.red_until = now + RED_HOLD
+        return [kind]
 
     def _clear(self, which: str) -> None:
         setattr(self, f"{which}_center", None)
         setattr(self, f"{which}_since", None)
         setattr(self, f"{which}_alarmed", False)
         setattr(self, f"{which}_misses", 0)
+        setattr(self, f"{which}_tracks", [])
         self.elapsed = 0.0
         self.watching = False

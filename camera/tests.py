@@ -944,6 +944,63 @@ class AnalyticsTests(TestCase):
         self.assertTrue(monitor.showing_red(11))
         self.assertFalse(monitor.showing_red(20))
 
+    def test_large_zone_still_spot_survives_a_moving_block(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.02, 0.02], [0.98, 0.02], [0.98, 0.98], [0.02, 0.98]]
+        base = np.full((200, 280, 3), 110, dtype=np.uint8)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(base, points, [], 0, 3, False, True), [])
+        alarms = []
+        for step in range(6):
+            frame = base.copy()
+            left = 8 + step * 22
+            cv2.rectangle(frame, (left, 20), (left + 46, 110), (16, 16, 16), -1)
+            cv2.ellipse(frame, (236, 150), (16, 12), 0, 0, 360, (20, 20, 20), -1)
+            alarms = monitor.update(frame, points, [], float(step + 1), 3, False, True)
+            if step == 2:
+                self.assertGreaterEqual(monitor.elapsed, 2)
+                self.assertEqual(alarms, [])
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_removed"])
+
+    def test_smooth_helmet_alarms_on_a_textured_desk(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        desk = np.full((200, 280, 3), 120, dtype=np.uint8)
+        for row in range(0, 200, 7):
+            cv2.line(desk, (0, row), (279, row), (70, 70, 70), 1)
+        helmet = desk.copy()
+        cv2.ellipse(helmet, (150, 100), (26, 20), 0, 0, 360, (18, 18, 22), -1)
+        arrived = FieldMonitor()
+        self.assertEqual(arrived.update(desk, points, [], 0, 2, True, False), [])
+        alarms = []
+        now = 1.0
+        for _frame in range(12):
+            alarms = arrived.update(helmet, points, [], now, 2, True, False)
+            now += 0.5
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_in"])
+        removed = FieldMonitor()
+        self.assertEqual(removed.update(helmet, points, [], 0, 2, False, True), [])
+        alarms = []
+        now = 1.0
+        for _frame in range(12):
+            alarms = removed.update(desk, points, [], now, 2, False, True)
+            now += 0.5
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_removed"])
+
     def test_saved_zone_row_becomes_an_analytics_rule(self):
         import importlib
 

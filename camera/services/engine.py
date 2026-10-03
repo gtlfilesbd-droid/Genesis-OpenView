@@ -19,7 +19,7 @@ from .dwell import DwellTracker
 from .geom import box_bottom_center, box_matches_area, line_cross
 from .rules import PERSON_KINDS
 from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
-from .scene import FieldMonitor
+from .scene import PERSON_MASK_CONF, FieldMonitor
 
 _stderr_lock = threading.Lock()
 _RTSP_SECRET = re.compile(r"rtsp://\S+", re.IGNORECASE)
@@ -709,13 +709,16 @@ class Engine:
                 object_rules.append(rule)
 
         person_boxes = []
+        scene_people = []
         count_boxes = []
-        for track_id, coords, class_id, _conf in boxes:
+        for track_id, coords, class_id, conf in boxes:
             if class_id != 0:
                 continue
             count_boxes.append((track_id, coords))
             if track_id >= 0:
                 person_boxes.append((track_id, coords))
+                if float(conf) >= PERSON_MASK_CONF:
+                    scene_people.append(coords)
         feet = {
             int(track_id): box_bottom_center(coords, width, height)
             for track_id, coords in person_boxes
@@ -772,7 +775,7 @@ class Engine:
                 monitor.update(
                     frame,
                     rule.points,
-                    [coords for _track_id, coords in person_boxes],
+                    scene_people,
                     now,
                     rule.duration_seconds,
                     rule.kind == "object_in",
