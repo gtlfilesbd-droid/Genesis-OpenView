@@ -14,9 +14,12 @@ import torch
 from ultralytics import YOLO
 
 from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
+from .count import CrowdTimer, PeopleCounter
 from .dwell import DwellTracker
-from .geom import point_in_polygon
+from .geom import box_bottom_center, box_iou, foot_point, line_cross, point_in_polygon
+from .rules import PERSON_KINDS
 from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
+from .scene import FieldMonitor
 
 _stderr_lock = threading.Lock()
 _RTSP_SECRET = re.compile(r"rtsp://\S+", re.IGNORECASE)
@@ -86,7 +89,31 @@ def _draw_zone(image, points) -> None:
         dtype=np.int32,
     )
     if len(polygon) >= 2:
-        cv2.polylines(image, [polygon], True, (40, 200, 240), 2)
+        cv2.polylines(image, [polygon], len(polygon) >= 3, (40, 200, 240), 2)
+
+
+def _draw_line(image, points) -> None:
+    if len(points) < 2:
+        return
+    height, width = image.shape[:2]
+    start = (int(float(points[0][0]) * width), int(float(points[0][1]) * height))
+    end = (int(float(points[1][0]) * width), int(float(points[1][1]) * height))
+    cv2.arrowedLine(image, start, end, (40, 200, 240), 2, tipLength=0.08)
+
+
+def _draw_shapes(image, shapes) -> None:
+    for kind, points in shapes:
+        if kind == "line":
+            _draw_line(image, points)
+        else:
+            _draw_zone(image, points)
+
+
+def _draw_captions(image, lines) -> None:
+    y = 32
+    for text in lines:
+        cv2.putText(image, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 220, 240), 2, cv2.LINE_AA)
+        y += 32
 
 
 def _open_capture(url: str) -> cv2.VideoCapture:
@@ -227,15 +254,27 @@ class Engine:
         self.error = ""
         self.persons: list[dict] = []
         self.detections: list[dict] = []
+        self.people_count = None
+        self.crowd_count = None
         self.enabled_classes = set(DEFAULT_ENABLED)
         self.latest_jpeg = b""
         self.raw_jpeg = b""
         self.raw_at = 0.0
         self.last_alarm: dict | None = None
-        self._zone_cached = None
-        self._zone_at = 0.0
+        self._rules_cached: list = []
+        self._rules_at = 0.0
+        self._rules_camera = 0
+        self._counters: dict[int, PeopleCounter] = {}
+        self._crowds: dict[int, CrowdTimer] = {}
+        self._line_tracks: dict[int, dict] = {}
+        self._line_alarmed: dict[int, set] = {}
+        self._fields: dict[int, FieldMonitor] = {}
+        self._field_stamps: dict[int, str] = {}
+        self._pose_model = None
+        self._pose_name = ""
         self._last_draw: list[tuple] = []
-        self._last_polygon: list[tuple[float, float]] = []
+        self._last_shapes: list[tuple] = []
+        self._last_captions: list[str] = []
         self._face_jobs: dict[int, tuple] = {}
         self._face_lock = threading.Lock()
         threading.Thread(target=self._face_worker, name="face-match", daemon=True).start()
@@ -272,8 +311,15 @@ class Engine:
         with self._face_lock:
             self._face_jobs = {}
         self._last_draw = []
-        self._last_polygon = []
-        self._zone_at = 0.0
+        self._last_shapes = []
+        self._last_captions = []
+        self._rules_at = 0.0
+        self._counters = {}
+        self._crowds = {}
+        self._line_tracks = {}
+        self._line_alarmed = {}
+        self._fields = {}
+        self._field_stamps = {}
         with self._lock:
             self.camera_number = int(camera_number)
             self.stream = stream if stream in ("sub", "main") else "sub"
@@ -282,6 +328,8 @@ class Engine:
             self.error = ""
             self.persons = []
             self.detections = []
+            self.people_count = None
+            self.crowd_count = None
             self.latest_jpeg = b""
             self.channel = ""
         self._warm_faces()
@@ -301,6 +349,8 @@ class Engine:
             self.starting = False
             self.persons = []
             self.detections = []
+            self.people_count = None
+            self.crowd_count = None
             self.latest_jpeg = b""
             self.raw_jpeg = b""
 
@@ -341,6 +391,8 @@ class Engine:
                 "error": self.error,
                 "persons": list(self.persons),
                 "detections": list(self.detections),
+                "people_count": self.people_count,
+                "crowd_count": self.crowd_count,
                 "enabled": set(self.enabled_classes),
                 "alarm": alarm,
             }
@@ -390,7 +442,7 @@ class Engine:
             return
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # The small model keeps the CPU preview smooth. CUDA can carry the larger one.
-        weight_name = "yolo11s.pt" if device == "cuda" else "yolo11n.pt"
+        weight_name = "yolo11m.pt" if device == "cuda" else "yolo11n.pt"
         imgsz = 640 if device == "cuda" else 480
         with self._lock:
             if generation != self._generation:
@@ -477,25 +529,40 @@ class Engine:
                 self.running = False
                 self.starting = False
 
-    def _load_zone(self):
+    def _load_rules(self):
         now = time.monotonic()
-        if now - self._zone_at < 2:
-            return self._zone_cached
-        from camera.models import Zone
+        if now - self._rules_at < 2 and self._rules_camera == self.camera_number:
+            return self._rules_cached
+        from camera.models import AnalyticsRule
 
-        self._zone_cached = Zone.objects.filter(camera_number=self.camera_number, active=True).first()
-        self._zone_at = now
-        return self._zone_cached
+        self._rules_cached = list(
+            AnalyticsRule.objects.filter(camera_number=self.camera_number, active=True)
+        )
+        self._rules_at = now
+        self._rules_camera = self.camera_number
+        return self._rules_cached
+
+    def _ensure_pose(self, device: str):
+        name = "yolo11s-pose.pt" if device == "cuda" else "yolo11n-pose.pt"
+        if self._pose_model is not None and self._pose_name == name:
+            return self._pose_model
+        try:
+            self._pose_model = YOLO(str(ROOT / name))
+            self._pose_name = name
+        except Exception as exc:
+            print("pose load:", type(exc).__name__, exc)
+            self._pose_model = None
+        return self._pose_model
 
     def _publish_preview(self, frame, generation: int) -> None:
         """Show the newest camera frame with the last boxes, without running the model again."""
         if generation != self._generation:
             return
         plotted = frame.copy()
-        if self._last_polygon:
-            _draw_zone(plotted, self._last_polygon)
+        _draw_shapes(plotted, self._last_shapes)
         for coords, text, known in self._last_draw:
             _draw_box(plotted, coords, text, known)
+        _draw_captions(plotted, self._last_captions)
         ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         if not ok:
             return
@@ -506,19 +573,22 @@ class Engine:
     def _handle_frame(self, model, frame, generation: int, device: str, imgsz: int) -> None:
         from django.db import close_old_connections
 
-        if time.monotonic() - self._zone_at >= 2:
+        if time.monotonic() - self._rules_at >= 2:
             close_old_connections()
         if generation != self._generation:
             return
         plotted = frame.copy()
         height, width = frame.shape[:2]
+        rules = self._load_rules()
         class_ids = self._enabled_ids()
+        if any(rule.kind in PERSON_KINDS for rule in rules) and 0 not in class_ids:
+            class_ids = sorted({*class_ids, 0})
         boxes = []
         if class_ids:
             results = model.track(
                 frame,
                 persist=True,
-                tracker="bytetrack.yaml",
+                tracker="botsort.yaml",
                 classes=class_ids,
                 imgsz=imgsz,
                 conf=0.30,
@@ -528,27 +598,75 @@ class Engine:
             if results:
                 boxes = _read_boxes(results[0])
 
-        zone = self._load_zone()
         now = time.monotonic()
-        polygon = []
-        dwell_seconds = 60
-        if zone and len(zone.points) >= 3:
-            polygon = [(float(point[0]), float(point[1])) for point in zone.points]
-            dwell_seconds = zone.dwell_seconds
-            _draw_zone(plotted, polygon)
+        shapes = []
+        zone_rule = None
+        line_rule = None
+        count_rule = None
+        crowd_rule = None
+        object_rules = []
+        for rule in rules:
+            points = rule.points or []
+            if rule.kind == "line_cross" and len(points) >= 2:
+                line_rule = rule
+                shapes.append(("line", points[:2]))
+            elif len(points) >= 3 and rule.kind == "zone":
+                zone_rule = rule
+                shapes.append(("poly", points))
+            elif len(points) >= 3 and rule.kind == "people_count":
+                count_rule = rule
+                shapes.append(("poly", points))
+            elif len(points) >= 3 and rule.kind == "crowd":
+                crowd_rule = rule
+                shapes.append(("poly", points))
+            elif len(points) >= 3 and rule.kind in ("object_in", "object_removed"):
+                object_rules.append(rule)
+                shapes.append(("poly", points))
+        _draw_shapes(plotted, shapes)
 
-        present: dict[int, bool] = {}
         person_boxes = []
         for track_id, coords, class_id, _conf in boxes:
             if class_id != 0 or track_id < 0:
                 continue
             person_boxes.append((track_id, coords))
-            if polygon:
-                x1, y1, x2, y2 = coords
-                present[track_id] = point_in_polygon((x1 + x2) / 2 / width, y2 / height, polygon)
-            else:
-                present[track_id] = False
+        need_pose = any(rule is not None for rule in (zone_rule, line_rule, count_rule, crowd_rule))
+        if need_pose and person_boxes:
+            feet = _feet_for_people(self._ensure_pose(device), frame, person_boxes, width, height, device, imgsz)
+        else:
+            feet = {
+                int(track_id): box_bottom_center(coords, width, height)
+                for track_id, coords in person_boxes
+            }
+
+        present: dict[int, bool] = {}
+        dwell_seconds = 60
+        if zone_rule is not None:
+            dwell_seconds = zone_rule.duration_seconds
+            present = _inside_map(person_boxes, feet, zone_rule.points, width, height)
+        if zone_rule is None:
+            present = {}
         alarm_ids = self._dwell.update(present, now, dwell_seconds)
+
+        line_ids = []
+        if line_rule is not None:
+            line_ids = self._cross_line(line_rule, feet)
+
+        captions = []
+        people_count = None
+        if count_rule is not None:
+            people_count = self._count_people(count_rule, person_boxes, feet, width, height)
+            captions.append(f"People: {people_count}")
+        crowd_count = None
+        crowd_hit = False
+        if crowd_rule is not None:
+            crowd_count = self._count_people(crowd_rule, person_boxes, feet, width, height)
+            captions.append(f"Crowd: {crowd_count}")
+            timer = self._crowds.get(crowd_rule.id)
+            if timer is None:
+                timer = CrowdTimer()
+                self._crowds[crowd_rule.id] = timer
+            crowd_hit = timer.update(crowd_count, now, crowd_rule.max_people, crowd_rule.duration_seconds)
+
         self._queue_face(generation, frame, person_boxes, now)
 
         persons = []
@@ -594,11 +712,34 @@ class Engine:
                 }
             )
 
-        if alarm_ids and polygon:
-            self._raise_alarms(frame, plotted, person_boxes, alarm_ids)
+        _draw_captions(plotted, captions)
+        if alarm_ids and zone_rule is not None:
+            self._raise_alarms(frame, plotted, person_boxes, alarm_ids, kind="zone")
+        if line_ids:
+            self._raise_alarms(frame, plotted, person_boxes, line_ids, kind="line_cross")
+        if crowd_hit:
+            self._raise_scene_alarm(plotted, "crowd")
+        for rule in object_rules:
+            stamp = rule.updated_at.isoformat() if rule.updated_at else ""
+            monitor = self._fields.get(rule.id)
+            if monitor is None or self._field_stamps.get(rule.id) != stamp:
+                monitor = FieldMonitor()
+                self._fields[rule.id] = monitor
+                self._field_stamps[rule.id] = stamp
+            for event in monitor.update(
+                frame,
+                rule.points,
+                [coords for _track_id, coords in person_boxes],
+                now,
+                rule.duration_seconds,
+                rule.kind == "object_in",
+                rule.kind == "object_removed",
+            ):
+                self._raise_scene_alarm(plotted, event)
 
         self._last_draw = draw
-        self._last_polygon = polygon
+        self._last_shapes = shapes
+        self._last_captions = captions
         ok, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
         raw_due = time.time() - self.raw_at >= 1
         ok_raw, raw = (False, None)
@@ -609,11 +750,46 @@ class Engine:
                 return
             self.persons = persons
             self.detections = detections
+            self.people_count = people_count
+            self.crowd_count = crowd_count
             if ok:
                 self.latest_jpeg = encoded.tobytes()
             if ok_raw:
                 self.raw_jpeg = raw.tobytes()
                 self.raw_at = time.time()
+
+    def _count_people(self, rule, person_boxes, feet, width: int, height: int) -> int:
+        counter = self._counters.get(rule.id)
+        if counter is None:
+            counter = PeopleCounter()
+            self._counters[rule.id] = counter
+        return counter.update(_inside_map(person_boxes, feet, rule.points, width, height))
+
+    def _cross_line(self, rule, feet: dict[int, tuple]) -> list[int]:
+        previous = self._line_tracks.setdefault(rule.id, {})
+        alarmed = self._line_alarmed.setdefault(rule.id, set())
+        line = [(float(point[0]), float(point[1])) for point in rule.points[:2]]
+        alarms = []
+        live = set()
+        for track_id, point in feet.items():
+            track_id = int(track_id)
+            live.add(track_id)
+            prior = previous.get(track_id)
+            previous[track_id] = point
+            if prior is None or track_id in alarmed:
+                continue
+            crossed = line_cross(prior, point, line[0], line[1])
+            if crossed is None:
+                continue
+            if rule.direction != "any" and crossed != rule.direction:
+                continue
+            alarmed.add(track_id)
+            alarms.append(track_id)
+        for track_id in list(previous):
+            if track_id not in live:
+                previous.pop(track_id, None)
+                alarmed.discard(track_id)
+        return alarms
 
     def _gallery_people(self) -> list[tuple]:
         if self._gallery_at and time.monotonic() - self._gallery_at < 5:
@@ -779,6 +955,7 @@ class Engine:
             person=person,
             matched_name=person.name,
             score=score,
+            kind="blacklist",
         )
         stamp = timezone.now().strftime("%Y%m%d-%H%M%S")
         alarm.snapshot.save(f"{stamp}-{int(track_id)}-list.jpg", ContentFile(jpeg.tobytes()), save=False)
@@ -800,15 +977,48 @@ class Engine:
                 "track_id": int(track_id),
                 "camera": self.camera_number,
                 "at": time.time(),
+                "kind": "blacklist",
+                "label": "Blacklist",
                 "active": True,
             }
         return True
 
-    def _raise_alarms(self, frame, plotted, person_boxes, alarm_ids: list[int]) -> None:
+    def _raise_scene_alarm(self, plotted, kind: str) -> None:
         from django.core.files.base import ContentFile
         from django.utils import timezone
 
-        from camera.models import Alarm
+        from camera.models import ALARM_KIND_LABELS, Alarm
+
+        ok, jpeg = cv2.imencode(".jpg", plotted)
+        if not ok:
+            return
+        label = ALARM_KIND_LABELS.get(kind, kind)
+        alarm = Alarm(
+            camera_number=self.camera_number,
+            track_id=0,
+            matched_name=label,
+            kind=kind,
+        )
+        stamp = timezone.now().strftime("%Y%m%d-%H%M%S")
+        alarm.snapshot.save(f"{stamp}-{kind}.jpg", ContentFile(jpeg.tobytes()), save=False)
+        alarm.save()
+        with self._lock:
+            self.last_alarm = {
+                "id": alarm.id,
+                "name": label,
+                "track_id": 0,
+                "camera": self.camera_number,
+                "at": time.time(),
+                "kind": kind,
+                "label": label,
+                "active": True,
+            }
+
+    def _raise_alarms(self, frame, plotted, person_boxes, alarm_ids: list[int], kind: str = "zone") -> None:
+        from django.core.files.base import ContentFile
+        from django.utils import timezone
+
+        from camera.models import ALARM_KIND_LABELS, Alarm
 
         from .faces import best_match, embed_upper_body, model_ready, to_bytes
 
@@ -848,6 +1058,7 @@ class Engine:
                 person=matched,
                 matched_name=name,
                 score=score,
+                kind=kind,
             )
             stamp = timezone.now().strftime("%Y%m%d-%H%M%S")
             alarm.snapshot.save(
@@ -875,8 +1086,65 @@ class Engine:
                     "track_id": int(track_id),
                     "camera": self.camera_number,
                     "at": time.time(),
+                    "kind": kind,
+                    "label": ALARM_KIND_LABELS.get(kind, "Zone"),
                     "active": True,
                 }
+
+
+def _inside_map(person_boxes, feet, points, width: int, height: int) -> dict[int, bool]:
+    polygon = [(float(point[0]), float(point[1])) for point in points]
+    present = {}
+    for track_id, coords in person_boxes:
+        if track_id < 0:
+            continue
+        point = feet.get(int(track_id)) or box_bottom_center(coords, width, height)
+        present[int(track_id)] = point_in_polygon(point[0], point[1], polygon)
+    return present
+
+
+def _read_pose(result):
+    if result.boxes is None or result.keypoints is None or len(result.boxes) == 0:
+        return [], []
+    return result.boxes.xyxy.cpu().numpy(), result.keypoints.data.cpu().numpy()
+
+
+def _feet_for_people(pose_model, frame, person_boxes, width: int, height: int, device: str, imgsz: int):
+    fallback = {
+        int(track_id): box_bottom_center(coords, width, height)
+        for track_id, coords in person_boxes
+        if track_id >= 0
+    }
+    if pose_model is None or not person_boxes:
+        return fallback
+    try:
+        results = pose_model(frame, conf=0.25, imgsz=imgsz, device=device, verbose=False)
+    except Exception:
+        return fallback
+    if not results:
+        return fallback
+    pose_boxes, keypoints = _read_pose(results[0])
+    if len(pose_boxes) == 0:
+        return fallback
+    used = set()
+    feet = {}
+    for track_id, coords in person_boxes:
+        if track_id < 0:
+            continue
+        best_index = None
+        best_score = 0.25
+        for index, pose_box in enumerate(pose_boxes):
+            if index in used:
+                continue
+            score = box_iou(coords, pose_box)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        chosen = keypoints[best_index] if best_index is not None else None
+        if best_index is not None:
+            used.add(best_index)
+        feet[int(track_id)] = foot_point(coords, chosen, width, height)
+    return feet
 
 
 def _read_boxes(result) -> list[tuple]:

@@ -137,7 +137,7 @@
     <strong>Camera console</strong>
     <nav>
       <a href="{% url 'live' %}" {% if request.resolver_match.url_name == 'live' %}class="active"{% endif %}>Live</a>
-      <a href="{% url 'zone' %}" {% if request.resolver_match.url_name == 'zone' %}class="active"{% endif %}>Zone</a>
+      <a href="{% url 'analytics' %}" {% if request.resolver_match.url_name == 'analytics' %}class="active"{% endif %}>Analytics</a>
       <a href="{% url 'alarms' %}" {% if request.resolver_match.url_name == 'alarms' %}class="active"{% endif %}>Alarms</a>
       <a href="{% url 'recognition' %}" {% if request.resolver_match.url_name == 'recognition' %}class="active"{% endif %}>Recognition</a>
       <a href="{% url 'people' %}" {% if request.resolver_match.url_name == 'people' %}class="active"{% endif %}>People</a>

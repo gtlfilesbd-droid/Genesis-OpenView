@@ -1,0 +1,130 @@
+{% extends "camera/base.html" %}
+{% block title %}Analytics{% endblock %}
+{% block content %}
+<h1>Analytics</h1>
+<p class="muted">{{ hint }}</p>
+<form method="get" class="row">
+  <label>Camera number
+    <input type="number" name="camera" min="1" value="{{ camera }}" required>
+  </label>
+  <label><input type="radio" name="stream" value="sub" {% if stream == "sub" %}checked{% endif %}> Sub</label>
+  <label><input type="radio" name="stream" value="main" {% if stream == "main" %}checked{% endif %}> Main</label>
+  <label>Analytics
+    <select name="kind" onchange="this.form.submit()">
+      {% for item in kinds %}
+        <option value="{{ item.id }}" {% if item.id == kind %}selected{% endif %}>{{ item.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Load frame</button>
+</form>
+<div class="stage" id="stage">
+  <img id="frame" src="{% url 'zone_frame' %}?camera={{ camera }}&stream={{ stream }}" alt="Frame for {{ kind_label }}">
+  <canvas id="draw"></canvas>
+</div>
+<form method="post">
+  {% csrf_token %}
+  <input type="hidden" name="camera" value="{{ camera }}">
+  <input type="hidden" name="stream" value="{{ stream }}">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <input type="hidden" name="points" id="points">
+  {% if is_line %}
+    <fieldset class="row">
+      <legend class="muted">Direction</legend>
+      {% for item in directions %}
+        <label><input type="radio" name="direction" value="{{ item.id }}" {% if direction == item.id %}checked{% endif %}> {{ item.label }}</label>
+      {% endfor %}
+    </fieldset>
+  {% endif %}
+  {% if needs_people %}
+    <label>People before alarm
+      <input type="number" name="max_people" min="1" max="500" value="{{ max_people }}">
+    </label>
+  {% endif %}
+  {% if needs_duration %}
+    <div class="row">
+      <label>Minutes
+        <input type="number" name="minutes" min="0" max="60" value="{{ minutes }}">
+      </label>
+      <label>Seconds
+        <input type="number" name="seconds" min="0" max="59" value="{{ seconds }}">
+      </label>
+    </div>
+  {% endif %}
+  <div class="row">
+    <button type="submit">Save {{ kind_label }}</button>
+    <button type="button" class="ghost" id="undo">Undo point</button>
+    <button type="button" class="ghost" id="clear">Clear</button>
+    <button type="submit" class="ghost" name="action" value="remove">Remove</button>
+  </div>
+  <p id="count" class="muted"></p>
+</form>
+{{ points|json_script:"zone-data" }}
+<script>
+const img = document.getElementById("frame");
+const canvas = document.getElementById("draw");
+const ctx = canvas.getContext("2d");
+const pointsInput = document.getElementById("points");
+const count = document.getElementById("count");
+const lineMode = {{ is_line|yesno:"true,false" }};
+let points = JSON.parse(document.getElementById("zone-data").textContent || "[]");
+
+function sync() {
+  pointsInput.value = JSON.stringify(points);
+  count.textContent = points.length + " point" + (points.length === 1 ? "" : "s");
+}
+
+function arrow(x1, y1, x2, y2) {
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  const size = 12;
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - size * Math.cos(angle - 0.4), y2 - size * Math.sin(angle - 0.4));
+  ctx.lineTo(x2 - size * Math.cos(angle + 0.4), y2 - size * Math.sin(angle + 0.4));
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw() {
+  canvas.width = img.clientWidth;
+  canvas.height = img.clientHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!points.length) return;
+  ctx.strokeStyle = "#d7a441";
+  ctx.fillStyle = "#d7a441";
+  ctx.lineWidth = 2;
+  const placed = points.map((point) => [point[0] * canvas.width, point[1] * canvas.height]);
+  if (lineMode && placed.length === 2) {
+    placed.forEach(([x, y]) => ctx.fillRect(x - 3, y - 3, 6, 6));
+    arrow(placed[0][0], placed[0][1], placed[1][0], placed[1][1]);
+    return;
+  }
+  ctx.beginPath();
+  placed.forEach(([x, y], index) => {
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+    ctx.fillRect(x - 3, y - 3, 6, 6);
+  });
+  if (points.length > 2) ctx.closePath();
+  ctx.stroke();
+}
+
+canvas.addEventListener("click", (event) => {
+  if (lineMode && points.length >= 2) return;
+  const rect = canvas.getBoundingClientRect();
+  points.push([(event.clientX - rect.left) / rect.width, (event.clientY - rect.top) / rect.height]);
+  sync();
+  draw();
+});
+document.getElementById("undo").addEventListener("click", () => { points.pop(); sync(); draw(); });
+document.getElementById("clear").addEventListener("click", () => { points = []; sync(); draw(); });
+img.addEventListener("load", () => { sync(); draw(); });
+window.addEventListener("resize", draw);
+sync();
+if (img.complete) draw();
+</script>
+{% endblock %}

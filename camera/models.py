@@ -12,6 +12,59 @@ class Zone(models.Model):
         return f"Camera {self.camera_number} door"
 
 
+class AnalyticsRule(models.Model):
+    ZONE = "zone"
+    LINE_CROSS = "line_cross"
+    OBJECT_IN = "object_in"
+    OBJECT_REMOVED = "object_removed"
+    PEOPLE_COUNT = "people_count"
+    CROWD = "crowd"
+    KINDS = (
+        (ZONE, "Zone"),
+        (LINE_CROSS, "Line crossing"),
+        (OBJECT_IN, "Object in field"),
+        (OBJECT_REMOVED, "Remove object"),
+        (PEOPLE_COUNT, "People counting"),
+        (CROWD, "Crowd detection"),
+    )
+    FORWARD = "forward"
+    BACKWARD = "backward"
+    ANY = "any"
+    DIRECTIONS = (
+        (FORWARD, "Forward"),
+        (BACKWARD, "Backward"),
+        (ANY, "Any"),
+    )
+
+    camera_number = models.PositiveIntegerField()
+    kind = models.CharField(max_length=32, choices=KINDS)
+    points = models.JSONField(default=list)
+    direction = models.CharField(max_length=16, choices=DIRECTIONS, default=ANY)
+    duration_seconds = models.PositiveIntegerField(default=60)
+    max_people = models.PositiveIntegerField(default=5)
+    active = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["camera_number", "kind"], name="uniq_analytics_camera_kind"),
+        ]
+
+    def __str__(self) -> str:
+        return f"Camera {self.camera_number} {self.kind}"
+
+
+ALARM_KIND_LABELS = {
+    "zone": "Zone",
+    "line_cross": "Line crossing",
+    "object_in": "Object in field",
+    "object_removed": "Remove object",
+    "people_count": "People counting",
+    "crowd": "Crowd detection",
+    "blacklist": "Blacklist",
+}
+
+
 class Nvr(models.Model):
     host = models.CharField(max_length=64)
     username = models.CharField(max_length=128)
@@ -58,9 +111,13 @@ class Alarm(models.Model):
     person = models.ForeignKey(Person, null=True, blank=True, on_delete=models.SET_NULL)
     matched_name = models.CharField(max_length=120, default="Unknown")
     score = models.FloatField(null=True, blank=True)
+    kind = models.CharField(max_length=32, default="zone")
 
     class Meta:
         ordering = ["-created_at"]
+
+    def kind_label(self) -> str:
+        return ALARM_KIND_LABELS.get(self.kind, "Zone")
 
     def __str__(self) -> str:
         return f"Camera {self.camera_number} track {self.track_id}"

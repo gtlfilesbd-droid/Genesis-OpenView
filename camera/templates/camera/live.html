@@ -80,6 +80,8 @@ async function tick() {
     document.getElementById("video").dataset.live = "0";
   }
   meta.textContent = state + " · camera " + data.camera + " · channel " + (data.channel || "—") + " · " + data.device;
+  if (typeof data.people_count === "number") meta.textContent += " · people " + data.people_count;
+  if (typeof data.crowd_count === "number") meta.textContent += " · crowd " + data.crowd_count;
   error.textContent = data.error || "";
   latestGroups = data.classes || [];
   renderEnabled();
@@ -100,7 +102,9 @@ async function tick() {
   }
   if (data.alarm && data.alarm.active) {
     banner.hidden = false;
-    banner.textContent = "Alarm · person " + data.alarm.track_id + " · " + data.alarm.name;
+    let alarmText = data.alarm.label || "Alarm";
+    if (data.alarm.name && data.alarm.name !== alarmText) alarmText += " · " + data.alarm.name;
+    banner.textContent = alarmText;
     if (data.alarm.id !== lastAlarm) {
       lastAlarm = data.alarm.id;
       if (audioReady) beep();

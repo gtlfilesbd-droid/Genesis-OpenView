@@ -8,7 +8,8 @@ from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .models import Alarm, FaceCapture, Nvr, Person, PersonSample, Zone
+from .models import Alarm, AnalyticsRule, FaceCapture, Nvr, Person, PersonSample
+from .services.rules import DURATION_KINDS, total_seconds
 from .services.rtsp import configured_camera, env_nvr_fields, stream_url
 from .services.engine import engine, grab_jpeg, probe_stream
 from .services.faces import (
@@ -37,12 +38,16 @@ def _camera_number(value, default: int) -> int:
     return number if number > 0 else default
 
 
-def _clean_points(raw):
+def _clean_points(raw, exact=None):
     try:
         points = json.loads(raw or "[]")
     except json.JSONDecodeError:
         return None
-    if not isinstance(points, list) or len(points) < 3:
+    if not isinstance(points, list):
+        return None
+    if exact is None and len(points) < 3:
+        return None
+    if exact is not None and len(points) != exact:
         return None
     cleaned = []
     for point in points:
@@ -127,46 +132,95 @@ def objects(request):
     return JsonResponse({"ok": True, "classes": engine.class_groups()})
 
 
+_ANALYTICS_HINTS = {
+    "zone": "Click the area corners. A person is inside when an ankle, or the bottom of the box, is in the shape.",
+    "line_cross": "Click the start and end of the line. The arrow is forward. A person alarms when they cross in the chosen direction.",
+    "object_in": "Click the area corners. An alarm fires after something new stays in the area for the wait. People walking through are ignored.",
+    "object_removed": "Click the area corners. An alarm fires if something that was in the area is gone for the wait.",
+    "people_count": "Click the area corners. The live view shows how many people are standing in the shape.",
+    "crowd": "Click the area corners. An alarm fires when this many people stay in the area for the wait.",
+}
+
+
 def zone(request):
+    camera = request.GET.get("camera") or request.POST.get("camera") or ""
+    stream_name = request.GET.get("stream") or request.POST.get("stream") or ""
+    query = "kind=zone"
+    if camera:
+        query += f"&camera={camera}"
+    if stream_name in ("sub", "main"):
+        query += f"&stream={stream_name}"
+    return redirect(f"/analytics/?{query}")
+
+
+def analytics(request):
     engine.ensure_defaults()
     camera = _camera_number(request.GET.get("camera"), engine.camera_number)
     stream_name = _stream_name(request.GET.get("stream"), engine.stream)
+    kind = request.GET.get("kind") or AnalyticsRule.ZONE
     if request.method == "POST":
         camera = _camera_number(request.POST.get("camera"), camera)
         stream_name = _stream_name(request.POST.get("stream"), stream_name)
-        try:
-            dwell = int(request.POST.get("dwell_seconds", "60"))
-        except ValueError:
-            dwell = 60
-        dwell = min(3600, max(1, dwell))
+        kind = request.POST.get("kind") or kind
+        if kind not in dict(AnalyticsRule.KINDS):
+            kind = AnalyticsRule.ZONE
+        target = f"/analytics/?camera={camera}&stream={stream_name}&kind={kind}"
         if request.POST.get("action") == "remove":
-            Zone.objects.filter(camera_number=camera).delete()
-            messages.success(request, f"Door zone removed for camera {camera}.")
-            return redirect(f"/zone/?camera={camera}&stream={stream_name}")
-        points = _clean_points(request.POST.get("points"))
+            AnalyticsRule.objects.filter(camera_number=camera, kind=kind).delete()
+            messages.success(request, f"{dict(AnalyticsRule.KINDS)[kind]} removed for camera {camera}.")
+            return redirect(target)
+        exact = 2 if kind == AnalyticsRule.LINE_CROSS else None
+        points = _clean_points(request.POST.get("points"), exact=exact)
         if points is None:
-            messages.error(request, "Click at least 3 points on the frame.")
+            messages.error(
+                request,
+                "Click 2 points to draw the line." if exact == 2 else "Click at least 3 points on the frame.",
+            )
         else:
-            Zone.objects.update_or_create(
+            direction = request.POST.get("direction", AnalyticsRule.ANY)
+            if direction not in dict(AnalyticsRule.DIRECTIONS):
+                direction = AnalyticsRule.ANY
+            try:
+                max_people = int(request.POST.get("max_people", "5"))
+            except (TypeError, ValueError):
+                max_people = 5
+            max_people = min(500, max(1, max_people))
+            AnalyticsRule.objects.update_or_create(
                 camera_number=camera,
+                kind=kind,
                 defaults={
-                    "name": "Door",
                     "points": points,
-                    "dwell_seconds": dwell,
+                    "direction": direction,
+                    "duration_seconds": total_seconds(request.POST.get("minutes"), request.POST.get("seconds")),
+                    "max_people": max_people,
                     "active": True,
                 },
             )
-            messages.success(request, f"Door zone saved for camera {camera}.")
-            return redirect(f"/zone/?camera={camera}&stream={stream_name}")
-    saved = Zone.objects.filter(camera_number=camera).first()
+            messages.success(request, f"{dict(AnalyticsRule.KINDS)[kind]} saved for camera {camera}.")
+            return redirect(target)
+    if kind not in dict(AnalyticsRule.KINDS):
+        kind = AnalyticsRule.ZONE
+    saved = AnalyticsRule.objects.filter(camera_number=camera, kind=kind).first()
+    duration = saved.duration_seconds if saved else 60
     return render(
         request,
-        "camera/zone.html",
+        "camera/analytics.html",
         {
             "camera": camera,
             "stream": stream_name,
+            "kind": kind,
+            "kinds": [{"id": key, "label": label} for key, label in AnalyticsRule.KINDS],
             "points": saved.points if saved else [],
-            "dwell_seconds": saved.dwell_seconds if saved else 60,
+            "minutes": duration // 60,
+            "seconds": duration % 60,
+            "needs_duration": kind in DURATION_KINDS,
+            "needs_people": kind == AnalyticsRule.CROWD,
+            "is_line": kind == AnalyticsRule.LINE_CROSS,
+            "direction": saved.direction if saved else AnalyticsRule.ANY,
+            "directions": [{"id": key, "label": label} for key, label in AnalyticsRule.DIRECTIONS],
+            "max_people": saved.max_people if saved else 5,
+            "hint": _ANALYTICS_HINTS[kind],
+            "kind_label": dict(AnalyticsRule.KINDS)[kind],
         },
     )
 

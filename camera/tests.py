@@ -793,3 +793,164 @@ class FaceCaptureTests(TestCase):
         self.assertEqual(person.samples.count(), 2)
         self.assertEqual(capture.person_id, person.pk)
         self.assertEqual(capture.matched_name, "Ashraf")
+
+
+class AnalyticsTests(TestCase):
+    def test_minutes_and_seconds_add_up(self):
+        from camera.services.rules import total_seconds
+
+        self.assertEqual(total_seconds(1, 30), 90)
+        self.assertEqual(total_seconds(0, 0), 1)
+        self.assertEqual(total_seconds("90", "5"), 3600)
+
+    def test_low_confidence_ankle_uses_box_bottom(self):
+        from camera.services.geom import foot_point
+
+        keypoints = [[0, 0, 0.1] for _index in range(17)]
+        self.assertEqual(foot_point((10, 10, 30, 50), keypoints, 100, 100), (0.2, 0.5))
+
+    def test_confident_ankle_is_the_foot(self):
+        from camera.services.geom import foot_point
+
+        keypoints = [[0, 0, 0.1] for _index in range(17)]
+        keypoints[15] = [40, 80, 0.95]
+        self.assertEqual(foot_point((10, 10, 30, 50), keypoints, 100, 100), (0.4, 0.8))
+
+    def test_line_cross_direction_jitter_and_miss(self):
+        from camera.services.geom import line_cross
+
+        start, end = (0.2, 0.2), (0.2, 0.8)
+        self.assertEqual(line_cross((0.4, 0.5), (0.05, 0.5), start, end), "forward")
+        self.assertEqual(line_cross((0.05, 0.5), (0.4, 0.5), start, end), "backward")
+        self.assertIsNone(line_cross((0.201, 0.5), (0.199, 0.5), start, end))
+        self.assertIsNone(line_cross((0.4, 0.1), (0.0, 0.1), (0.2, 0.4), (0.2, 0.6)))
+
+    def test_people_count_waits_for_stable_frames(self):
+        from camera.services.count import PeopleCounter
+
+        counter = PeopleCounter()
+        self.assertEqual(counter.update({1: True}), 0)
+        self.assertEqual(counter.update({1: True}), 0)
+        self.assertEqual(counter.update({1: True}), 1)
+        self.assertEqual(counter.update({1: False}), 0)
+
+    def test_crowd_dip_does_not_reset_the_wait(self):
+        from camera.services.count import CrowdTimer
+
+        timer = CrowdTimer()
+        self.assertFalse(timer.update(5, 0, 5, 10))
+        self.assertFalse(timer.update(3, 4, 5, 10))
+        self.assertFalse(timer.update(5, 4.2, 5, 10))
+        self.assertTrue(timer.update(5, 10, 5, 10))
+        self.assertFalse(timer.update(5, 12, 5, 10))
+        self.assertFalse(timer.update(1, 12, 5, 10))
+        self.assertFalse(timer.update(1, 13.5, 5, 10))
+        self.assertFalse(timer.update(5, 14, 5, 10))
+        self.assertTrue(timer.update(5, 24, 5, 10))
+
+    def test_person_and_light_do_not_raise_object_alarm(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        base = np.full((200, 280, 3), 90, dtype=np.uint8)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(base, points, [], 0, 2, True, False), [])
+        covered = base.copy()
+        cv2.rectangle(covered, (80, 60), (180, 150), (240, 240, 240), -1)
+        self.assertEqual(monitor.update(covered, points, [np.array([70, 40, 200, 170])], 5, 2, True, False), [])
+        bright = FieldMonitor()
+        self.assertEqual(bright.update(base, points, [], 0, 2, True, False), [])
+        self.assertEqual(bright.update(np.full_like(base, 180), points, [], 8, 2, True, False), [])
+
+    def test_removed_object_alarms_after_the_wait(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        armed = np.full((200, 280, 3), 90, dtype=np.uint8)
+        cv2.rectangle(armed, (70, 40), (190, 160), (15, 15, 15), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(armed, points, [], 0, 3, False, True), [])
+        empty = np.full_like(armed, 90)
+        self.assertEqual(monitor.update(empty, points, [], 1, 3, False, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 4, 3, False, True), ["object_removed"])
+
+    def test_placed_object_alarms_once_it_stays(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        base = np.full((200, 280, 3), 100, dtype=np.uint8)
+        monitor = FieldMonitor()
+        monitor.update(base, points, [], 0, 2, True, False)
+        for step in range(8):
+            monitor.update(base, points, [], step, 2, True, False)
+        placed = base.copy()
+        cv2.rectangle(placed, (90, 50), (190, 150), (240, 240, 240), -1)
+        alarms = []
+        now = 20.0
+        for _frame in range(50):
+            alarms = monitor.update(placed, points, [], now, 2, True, False)
+            now += 0.25
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_in"])
+        self.assertEqual(monitor.update(placed, points, [], now + 5, 2, True, False), [])
+
+    def test_saved_zone_row_becomes_an_analytics_rule(self):
+        import importlib
+
+        from django.apps import apps
+
+        copy_zones = importlib.import_module("camera.migrations.0005_analyticsrule").copy_zones
+        from camera.models import AnalyticsRule, Zone
+
+        Zone.objects.create(
+            camera_number=9,
+            points=[[0, 0], [1, 0], [1, 1]],
+            dwell_seconds=15,
+            active=True,
+        )
+        copy_zones(apps, None)
+        rule = AnalyticsRule.objects.get(camera_number=9, kind="zone")
+        self.assertEqual(rule.duration_seconds, 15)
+        self.assertEqual(rule.points, [[0, 0], [1, 0], [1, 1]])
+
+    def test_analytics_page_saves_minutes_and_seconds(self):
+        from camera.models import AnalyticsRule
+
+        response = self.client.post(
+            "/analytics/",
+            {
+                "camera": 2,
+                "stream": "sub",
+                "kind": "crowd",
+                "points": "[[0,0],[1,0],[0.2,1]]",
+                "minutes": 1,
+                "seconds": 15,
+                "max_people": 6,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        rule = AnalyticsRule.objects.get(camera_number=2, kind="crowd")
+        self.assertEqual(rule.duration_seconds, 75)
+        self.assertEqual(rule.max_people, 6)
+        page = self.client.get("/analytics/?camera=2&kind=crowd")
+        self.assertContains(page, "Crowd detection")
+        self.assertContains(page, 'name="seconds"')
+        line = self.client.get("/analytics/?camera=2&kind=line_cross")
+        self.assertContains(line, "Forward")
+        self.assertNotContains(line, 'name="seconds"')
+
+    def test_zone_page_opens_zone_analytics(self):
+        response = self.client.get("/zone/?camera=4&stream=main")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("kind=zone", response.url)
+        self.assertIn("camera=4", response.url)
