@@ -110,10 +110,36 @@ def _draw_shapes(image, shapes) -> None:
 
 
 def _draw_captions(image, lines) -> None:
-    y = 32
+    """Count text at the top, about the same height as a camera date stamp."""
+    if not lines:
+        return
+    height, width = image.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    probe = cv2.getTextSize("People: 8", font, 1, 1)[0][1]
+    scale = max(1.0, (height * 0.06) / max(probe, 1))
+    thickness = max(2, int(round(scale)))
+    y = max(8, int(height * 0.02))
     for text in lines:
-        cv2.putText(image, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 220, 240), 2, cv2.LINE_AA)
-        y += 32
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+        x = max(8, (width - text_width) // 2)
+        cv2.rectangle(
+            image,
+            (x - 12, y),
+            (x + text_width + 12, y + text_height + baseline + 14),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            image,
+            text,
+            (x, y + text_height + 6),
+            font,
+            scale,
+            (80, 230, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        y += text_height + baseline + max(10, int(height * 0.015))
 
 
 def _open_capture(url: str) -> cv2.VideoCapture:
