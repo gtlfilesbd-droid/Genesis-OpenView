@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 
 MIN_AREA_RATIO = 0.004
+MIN_FRAME_RATIO = 0.0002
 MAX_AREA_RATIO = 0.85
 LIGHT_RATIO = 0.92
 DIFF_THRESH = 28
@@ -72,7 +73,7 @@ def local_blobs(current: np.ndarray, reference: np.ndarray, mask: np.ndarray):
         return [], True
     height, width = current.shape[:2]
     roi = max(1, int(np.count_nonzero(mask)))
-    floor = MIN_AREA_RATIO * height * width
+    floor = min(MIN_AREA_RATIO * roi, MIN_FRAME_RATIO * height * width)
     ceiling = MAX_AREA_RATIO * roi
     found = []
     contours, _hierarchy = cv2.findContours(changed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

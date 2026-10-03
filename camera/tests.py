@@ -1001,6 +1001,27 @@ class AnalyticsTests(TestCase):
                 break
         self.assertEqual(alarms, ["object_removed"])
 
+    def test_key_ring_in_a_large_zone_alarms(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.02, 0.02], [0.98, 0.02], [0.98, 0.98], [0.02, 0.98]]
+        base = np.full((200, 280, 3), 110, dtype=np.uint8)
+        placed = base.copy()
+        cv2.ellipse(placed, (150, 100), (8, 6), 0, 0, 360, (20, 20, 20), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(base, points, [], 0, 2, True, False), [])
+        alarms = []
+        now = 1.0
+        for _frame in range(12):
+            alarms = monitor.update(placed, points, [], now, 2, True, False)
+            now += 0.5
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_in"])
+
     def test_saved_zone_row_becomes_an_analytics_rule(self):
         import importlib
 
