@@ -11,6 +11,13 @@ class ZoneGeometryTests(TestCase):
         self.assertTrue(point_in_polygon(0.5, 0.5, square))
         self.assertFalse(point_in_polygon(1.5, 0.5, square))
 
+    def test_body_inside_counts_when_feet_are_outside(self):
+        from camera.services.geom import box_in_polygon
+
+        area = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.8], [0.05, 0.8]]
+        self.assertTrue(box_in_polygon((400, 200, 600, 500), 640, 480, area))
+        self.assertFalse(box_in_polygon((10, 10, 40, 40), 640, 480, area))
+
     def test_dwell_alarms_once_per_visit(self):
         tracker = DwellTracker()
         self.assertEqual(tracker.update({4: True}, 0, 60), [])

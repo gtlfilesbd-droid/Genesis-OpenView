@@ -25,6 +25,23 @@ def box_bottom_center(coords, width: float, height: float) -> tuple[float, float
     return (float(x1) + float(x2)) / 2 / width, float(y2) / height
 
 
+def box_in_polygon(coords, width: float, height: float, points) -> bool:
+    """True when the person's body sits in the area, even if their feet are outside it."""
+    x1, y1, x2, y2 = [float(value) for value in coords]
+    if x2 <= x1 or y2 <= y1 or width <= 0 or height <= 0:
+        return False
+    hits = 0
+    for across in (0.3, 0.5, 0.7):
+        for down in (0.35, 0.55, 0.75):
+            if point_in_polygon(
+                (x1 + (x2 - x1) * across) / width,
+                (y1 + (y2 - y1) * down) / height,
+                points,
+            ):
+                hits += 1
+    return hits >= 2
+
+
 def best_ankle(keypoints, width: float, height: float):
     if keypoints is None:
         return None

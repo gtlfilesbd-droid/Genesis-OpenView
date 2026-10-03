@@ -16,7 +16,7 @@ from ultralytics import YOLO
 from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
 from .count import CrowdTimer, PeopleCounter
 from .dwell import DwellTracker
-from .geom import box_bottom_center, line_cross, point_in_polygon
+from .geom import box_bottom_center, box_in_polygon, line_cross, point_in_polygon
 from .rules import PERSON_KINDS
 from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
 from .scene import FieldMonitor
@@ -709,10 +709,13 @@ class Engine:
                 object_rules.append(rule)
 
         person_boxes = []
+        count_boxes = []
         for track_id, coords, class_id, _conf in boxes:
-            if class_id != 0 or track_id < 0:
+            if class_id != 0:
                 continue
-            person_boxes.append((track_id, coords))
+            count_boxes.append((track_id, coords))
+            if track_id >= 0:
+                person_boxes.append((track_id, coords))
         feet = {
             int(track_id): box_bottom_center(coords, width, height)
             for track_id, coords in person_boxes
@@ -739,12 +742,12 @@ class Engine:
         timers = []
         people_count = None
         if count_rule is not None:
-            people_count = self._count_people(count_rule, person_boxes, feet, width, height)
+            people_count = self._count_people(count_rule, count_boxes, width, height)
             captions.append(f"People: {people_count}")
         crowd_count = None
         crowd_hit = False
         if crowd_rule is not None:
-            crowd_count = self._count_people(crowd_rule, person_boxes, feet, width, height)
+            crowd_count = self._count_people(crowd_rule, count_boxes, width, height)
             timer = self._crowds.get(crowd_rule.id)
             if timer is None:
                 timer = CrowdTimer()
@@ -866,12 +869,16 @@ class Engine:
                 self.raw_jpeg = raw.tobytes()
                 self.raw_at = time.time()
 
-    def _count_people(self, rule, person_boxes, feet, width: int, height: int) -> int:
+    def _count_people(self, rule, person_boxes, width: int, height: int) -> int:
         counter = self._counters.get(rule.id)
         if counter is None:
             counter = PeopleCounter()
             self._counters[rule.id] = counter
-        return counter.update(_inside_map(person_boxes, feet, rule.points, width, height))
+        present = {}
+        for index, (track_id, coords) in enumerate(person_boxes):
+            key = int(track_id) if track_id >= 0 else -(index + 1)
+            present[key] = box_in_polygon(coords, width, height, rule.points)
+        return counter.update(present)
 
     def _cross_line(self, rule, feet: dict[int, tuple]) -> list[int]:
         previous = self._line_tracks.setdefault(rule.id, {})
