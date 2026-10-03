@@ -18,6 +18,16 @@ class ZoneGeometryTests(TestCase):
         self.assertTrue(box_in_polygon((400, 200, 600, 500), 640, 480, area))
         self.assertFalse(box_in_polygon((10, 10, 40, 40), 640, 480, area))
 
+    def test_touch_counts_a_partial_box_and_inside_does_not(self):
+        from camera.services.geom import box_matches_area
+
+        area = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.8], [0.05, 0.8]]
+        hanging = (400, 200, 600, 500)
+        whole = (200, 80, 400, 300)
+        self.assertTrue(box_matches_area(hanging, 640, 480, area, "touch"))
+        self.assertFalse(box_matches_area(hanging, 640, 480, area, "inside"))
+        self.assertTrue(box_matches_area(whole, 640, 480, area, "inside"))
+
     def test_dwell_alarms_once_per_visit(self):
         tracker = DwellTracker()
         self.assertEqual(tracker.update({4: True}, 0, 60), [])

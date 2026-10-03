@@ -16,7 +16,7 @@ from ultralytics import YOLO
 from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
 from .count import CrowdTimer, PeopleCounter
 from .dwell import DwellTracker
-from .geom import box_bottom_center, box_in_polygon, line_cross, point_in_polygon
+from .geom import box_bottom_center, box_matches_area, line_cross
 from .rules import PERSON_KINDS
 from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
 from .scene import FieldMonitor
@@ -725,7 +725,7 @@ class Engine:
         dwell_seconds = 60
         if zone_rule is not None:
             dwell_seconds = zone_rule.duration_seconds
-            present = _inside_map(person_boxes, feet, zone_rule.points, width, height)
+            present = _inside_map(person_boxes, width, height, zone_rule.points, zone_rule.coverage)
         if zone_rule is None:
             present = {}
         alarm_ids = self._dwell.update(present, now, dwell_seconds)
@@ -777,6 +777,7 @@ class Engine:
                     rule.duration_seconds,
                     rule.kind == "object_in",
                     rule.kind == "object_removed",
+                    getattr(rule, "coverage", "touch"),
                 )
             )
             extra = {"red": monitor.showing_red(now)}
@@ -877,7 +878,7 @@ class Engine:
         present = {}
         for index, (track_id, coords) in enumerate(person_boxes):
             key = int(track_id) if track_id >= 0 else -(index + 1)
-            present[key] = box_in_polygon(coords, width, height, rule.points)
+            present[key] = box_matches_area(coords, width, height, rule.points, getattr(rule, "coverage", "touch"))
         return counter.update(present)
 
     def _cross_line(self, rule, feet: dict[int, tuple]) -> list[int]:
@@ -1207,14 +1208,12 @@ class Engine:
                 }
 
 
-def _inside_map(person_boxes, feet, points, width: int, height: int) -> dict[int, bool]:
-    polygon = [(float(point[0]), float(point[1])) for point in points]
+def _inside_map(person_boxes, width: int, height: int, points, coverage: str) -> dict[int, bool]:
     present = {}
     for track_id, coords in person_boxes:
         if track_id < 0:
             continue
-        point = feet.get(int(track_id)) or box_bottom_center(coords, width, height)
-        present[int(track_id)] = point_in_polygon(point[0], point[1], polygon)
+        present[int(track_id)] = box_matches_area(coords, width, height, points, coverage)
     return present
 
 

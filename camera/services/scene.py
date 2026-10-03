@@ -136,12 +136,25 @@ class FieldMonitor:
     def showing_red(self, now: float) -> bool:
         return now < self.red_until
 
-    def update(self, frame, points, person_boxes, now: float, duration: float, want_in: bool, want_removed: bool):
+    def update(
+        self,
+        frame,
+        points,
+        person_boxes,
+        now: float,
+        duration: float,
+        want_in: bool,
+        want_removed: bool,
+        coverage: str = "touch",
+    ):
         frame, person_boxes = _fit_scene(frame, person_boxes)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         height, width = gray.shape[:2]
         mask = apply_person_mask(polygon_mask(height, width, points), person_boxes, width, height)
+        if coverage == "inside":
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            mask = cv2.erode(mask, kernel)
         if self.long_term is None or self.long_term.shape != gray.shape:
             self.long_term = gray.copy()
             self.armed = gray.copy()

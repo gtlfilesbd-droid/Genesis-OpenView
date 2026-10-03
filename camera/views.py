@@ -185,12 +185,16 @@ def analytics(request):
             except (TypeError, ValueError):
                 max_people = 5
             max_people = min(500, max(1, max_people))
+            coverage = request.POST.get("coverage", AnalyticsRule.TOUCH)
+            if coverage not in dict(AnalyticsRule.COVERAGE):
+                coverage = AnalyticsRule.TOUCH
             AnalyticsRule.objects.update_or_create(
                 camera_number=camera,
                 kind=kind,
                 defaults={
                     "points": points,
                     "direction": direction,
+                    "coverage": coverage,
                     "duration_seconds": total_seconds(request.POST.get("minutes"), request.POST.get("seconds")),
                     "max_people": max_people,
                     "active": True,
@@ -216,6 +220,9 @@ def analytics(request):
             "needs_duration": kind in DURATION_KINDS,
             "needs_people": kind == AnalyticsRule.CROWD,
             "is_line": kind == AnalyticsRule.LINE_CROSS,
+            "needs_coverage": kind != AnalyticsRule.LINE_CROSS,
+            "coverage": saved.coverage if saved else AnalyticsRule.TOUCH,
+            "coverages": [{"id": key, "label": label} for key, label in AnalyticsRule.COVERAGE],
             "direction": saved.direction if saved else AnalyticsRule.ANY,
             "directions": [{"id": key, "label": label} for key, label in AnalyticsRule.DIRECTIONS],
             "max_people": saved.max_people if saved else 5,

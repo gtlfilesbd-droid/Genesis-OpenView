@@ -28,6 +28,14 @@
   <input type="hidden" name="stream" value="{{ stream }}">
   <input type="hidden" name="kind" value="{{ kind }}">
   <input type="hidden" name="points" id="points">
+  {% if needs_coverage %}
+    <fieldset class="row">
+      <legend class="muted">When it counts</legend>
+      {% for item in coverages %}
+        <label><input type="radio" name="coverage" value="{{ item.id }}" {% if coverage == item.id %}checked{% endif %}> {{ item.label }}</label>
+      {% endfor %}
+    </fieldset>
+  {% endif %}
   {% if is_line %}
     <fieldset class="row">
       <legend class="muted">Direction</legend>

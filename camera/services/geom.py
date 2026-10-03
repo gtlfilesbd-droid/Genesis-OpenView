@@ -25,6 +25,25 @@ def box_bottom_center(coords, width: float, height: float) -> tuple[float, float
     return (float(x1) + float(x2)) / 2 / width, float(y2) / height
 
 
+def box_matches_area(coords, width: float, height: float, points, coverage: str = "touch") -> bool:
+    """Touch counts any overlap. Inside counts only when the whole box is in the area."""
+    x1, y1, x2, y2 = [float(value) for value in coords]
+    if x2 <= x1 or y2 <= y1 or width <= 0 or height <= 0:
+        return False
+    if coverage == "inside":
+        corners = ((x1, y1), (x2, y1), (x1, y2), (x2, y2))
+        return all(point_in_polygon(x / width, y / height, points) for x, y in corners)
+    for across in (0.0, 0.5, 1.0):
+        for down in (0.0, 0.5, 1.0):
+            if point_in_polygon(
+                (x1 + (x2 - x1) * across) / width,
+                (y1 + (y2 - y1) * down) / height,
+                points,
+            ):
+                return True
+    return False
+
+
 def box_in_polygon(coords, width: float, height: float, points) -> bool:
     """True when the person's body sits in the area, even if their feet are outside it."""
     x1, y1, x2, y2 = [float(value) for value in coords]
