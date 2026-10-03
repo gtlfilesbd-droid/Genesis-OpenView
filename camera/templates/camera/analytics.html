@@ -74,19 +74,25 @@ function sync() {
   count.textContent = points.length + " point" + (points.length === 1 ? "" : "s");
 }
 
-function arrow(x1, y1, x2, y2) {
+function directionArrow(x, y, ux, uy, reach, color, label) {
+  const tipX = x + ux * reach;
+  const tipY = y + uy * reach;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
   ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.lineTo(x2, y2);
+  ctx.moveTo(x, y);
+  ctx.lineTo(tipX, tipY);
   ctx.stroke();
-  const angle = Math.atan2(y2 - y1, x2 - x1);
-  const size = 12;
+  const angle = Math.atan2(uy, ux);
+  const size = 10;
   ctx.beginPath();
-  ctx.moveTo(x2, y2);
-  ctx.lineTo(x2 - size * Math.cos(angle - 0.4), y2 - size * Math.sin(angle - 0.4));
-  ctx.lineTo(x2 - size * Math.cos(angle + 0.4), y2 - size * Math.sin(angle + 0.4));
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - size * Math.cos(angle - 0.45), tipY - size * Math.sin(angle - 0.45));
+  ctx.lineTo(tipX - size * Math.cos(angle + 0.45), tipY - size * Math.sin(angle + 0.45));
   ctx.closePath();
   ctx.fill();
+  ctx.font = "14px sans-serif";
+  ctx.fillText(label, tipX + 6, tipY + 4);
 }
 
 function draw() {
@@ -99,8 +105,22 @@ function draw() {
   ctx.lineWidth = 2;
   const placed = points.map((point) => [point[0] * canvas.width, point[1] * canvas.height]);
   if (lineMode && placed.length === 2) {
+    const [x1, y1] = placed[0];
+    const [x2, y2] = placed[1];
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
     placed.forEach(([x, y]) => ctx.fillRect(x - 3, y - 3, 6, 6));
-    arrow(placed[0][0], placed[0][1], placed[1][0], placed[1][1]);
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const length = Math.hypot(dx, dy) || 1;
+    const leftX = -dy / length;
+    const leftY = dx / length;
+    const midX = (x1 + x2) / 2;
+    const midY = (y1 + y2) / 2;
+    directionArrow(midX, midY, leftX, leftY, 42, "#3ddc97", "Forward");
+    directionArrow(midX, midY, -leftX, -leftY, 42, "#e15b64", "Backward");
     return;
   }
   ctx.beginPath();

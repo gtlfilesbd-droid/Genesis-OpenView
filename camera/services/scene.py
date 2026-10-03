@@ -7,7 +7,9 @@ LIGHT_RATIO = 0.60
 DIFF_THRESH = 28
 CENTER_TOLERANCE = 0.02
 PERSON_GROW = 0.18
-MOVING_RATIO = 0.35
+SCENE_LONG_SIDE = 480
+RED_HOLD = 8.0
+MISS_LIMIT = 3
 
 
 def polygon_mask(height: int, width: int, points) -> np.ndarray:
@@ -91,26 +93,51 @@ def local_blobs(current: np.ndarray, reference: np.ndarray, mask: np.ndarray):
     return found, False
 
 
+def _fit_scene(frame, person_boxes):
+    height, width = frame.shape[:2]
+    longest = max(height, width)
+    if longest <= SCENE_LONG_SIDE:
+        return frame, person_boxes
+    scale = SCENE_LONG_SIDE / longest
+    small = cv2.resize(
+        frame,
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    scaled = []
+    for coords in person_boxes:
+        x1, y1, x2, y2 = [float(value) for value in coords]
+        scaled.append((x1 * scale, y1 * scale, x2 * scale, y2 * scale))
+    return small, scaled
+
+
 class FieldMonitor:
     """Stationary object appear and disappear inside a polygon.
 
-    MOG2 is the short-term model. A long-term reference keeps a placed object
-    visible after the short-term model has absorbed it. A whole-region brightness
-    jump is treated as a light change and does not alarm.
+    The clock starts when the changed spot stays put. A whole-region brightness
+    jump is a light change and does not alarm. People boxes are ignored.
     """
 
     def __init__(self) -> None:
-        self.mog = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=16, detectShadows=True)
         self.long_term = None
         self.armed = None
         self.in_center = None
         self.in_since = None
         self.in_alarmed = False
+        self.in_misses = 0
         self.out_center = None
         self.out_since = None
         self.out_alarmed = False
+        self.out_misses = 0
+        self.elapsed = 0.0
+        self.watching = False
+        self.red_until = 0.0
+
+    def showing_red(self, now: float) -> bool:
+        return now < self.red_until
 
     def update(self, frame, points, person_boxes, now: float, duration: float, want_in: bool, want_removed: bool):
+        frame, person_boxes = _fit_scene(frame, person_boxes)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         height, width = gray.shape[:2]
@@ -118,34 +145,26 @@ class FieldMonitor:
         if self.long_term is None or self.long_term.shape != gray.shape:
             self.long_term = gray.copy()
             self.armed = gray.copy()
-            self.mog.apply(gray, learningRate=0.05)
+            self.elapsed = 0.0
+            self.watching = False
             return []
-        foreground = self.mog.apply(gray, learningRate=0.05)
-        foreground[foreground == 127] = 0
-        moving = (foreground > 0) & (mask > 0)
         alarms = []
         if want_in:
-            alarms.extend(self._appear(gray, mask, moving, now, duration, width, height))
+            alarms.extend(self._appear(gray, mask, now, duration))
         if want_removed and self.armed is not None:
             alarms.extend(self._removed(gray, mask, now, duration))
         return alarms
 
-    def _appear(self, gray, mask, moving, now, duration, width, height):
+    def _appear(self, gray, mask, now, duration):
         blobs, global_light = local_blobs(gray, self.long_term, mask)
         if global_light:
             self.long_term[mask > 0] = gray[mask > 0]
             self._clear("in")
             return []
-        stationary = []
-        for blob in blobs:
-            if not blob["added"]:
-                continue
-            if self._moving_ratio(moving, blob["center"], width, height) > MOVING_RATIO:
-                continue
-            stationary.append(blob)
+        added = [blob for blob in blobs if blob["added"]]
         quiet = (cv2.absdiff(gray, self.long_term) < 12) & (mask > 0)
         self.long_term[quiet] = gray[quiet]
-        return self._track("in", stationary, now, duration, "object_in")
+        return self._track("in", added, now, duration, "object_in")
 
     def _removed(self, gray, mask, now, duration):
         blobs, global_light = local_blobs(gray, self.armed, mask)
@@ -156,22 +175,21 @@ class FieldMonitor:
         missing = [blob for blob in blobs if not blob["added"]]
         return self._track("out", missing, now, duration, "object_removed")
 
-    def _moving_ratio(self, moving, center, width: int, height: int) -> float:
-        cx = int(center[0] * width)
-        cy = int(center[1] * height)
-        radius = 12
-        patch = moving[max(0, cy - radius) : cy + radius, max(0, cx - radius) : cx + radius]
-        if patch.size == 0:
-            return 0.0
-        return float(np.count_nonzero(patch)) / patch.size
-
     def _track(self, which: str, blobs, now: float, duration: float, kind: str):
         center_name = f"{which}_center"
         since_name = f"{which}_since"
         alarm_name = f"{which}_alarmed"
+        miss_name = f"{which}_misses"
         if not blobs:
-            self._clear(which)
+            misses = getattr(self, miss_name) + 1
+            setattr(self, miss_name, misses)
+            if misses >= MISS_LIMIT:
+                self._clear(which)
+            elif getattr(self, since_name) is not None:
+                self.elapsed = max(0.0, now - getattr(self, since_name))
+                self.watching = True
             return []
+        setattr(self, miss_name, 0)
         blob = max(blobs, key=lambda item: item["area"])
         center = blob["center"]
         previous = getattr(self, center_name)
@@ -179,11 +197,16 @@ class FieldMonitor:
             setattr(self, center_name, center)
             setattr(self, since_name, now)
             setattr(self, alarm_name, False)
+            self.elapsed = 0.0
+            self.watching = True
             return []
+        self.elapsed = max(0.0, now - getattr(self, since_name))
+        self.watching = True
         if getattr(self, alarm_name):
             return []
-        if now - getattr(self, since_name) >= duration:
+        if self.elapsed >= duration:
             setattr(self, alarm_name, True)
+            self.red_until = now + RED_HOLD
             return [kind]
         return []
 
@@ -191,3 +214,6 @@ class FieldMonitor:
         setattr(self, f"{which}_center", None)
         setattr(self, f"{which}_since", None)
         setattr(self, f"{which}_alarmed", False)
+        setattr(self, f"{which}_misses", 0)
+        self.elapsed = 0.0
+        self.watching = False

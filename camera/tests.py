@@ -825,12 +825,10 @@ class AnalyticsTests(TestCase):
         self.assertIsNone(line_cross((0.201, 0.5), (0.199, 0.5), start, end))
         self.assertIsNone(line_cross((0.4, 0.1), (0.0, 0.1), (0.2, 0.4), (0.2, 0.6)))
 
-    def test_people_count_waits_for_stable_frames(self):
+    def test_people_count_counts_this_frame(self):
         from camera.services.count import PeopleCounter
 
         counter = PeopleCounter()
-        self.assertEqual(counter.update({1: True}), 0)
-        self.assertEqual(counter.update({1: True}), 0)
         self.assertEqual(counter.update({1: True}), 1)
         self.assertEqual(counter.update({1: False}), 0)
 
@@ -838,15 +836,16 @@ class AnalyticsTests(TestCase):
         from camera.services.count import CrowdTimer
 
         timer = CrowdTimer()
-        self.assertFalse(timer.update(5, 0, 5, 10))
-        self.assertFalse(timer.update(3, 4, 5, 10))
-        self.assertFalse(timer.update(5, 4.2, 5, 10))
-        self.assertTrue(timer.update(5, 10, 5, 10))
-        self.assertFalse(timer.update(5, 12, 5, 10))
-        self.assertFalse(timer.update(1, 12, 5, 10))
-        self.assertFalse(timer.update(1, 13.5, 5, 10))
-        self.assertFalse(timer.update(5, 14, 5, 10))
-        self.assertTrue(timer.update(5, 24, 5, 10))
+        self.assertFalse(timer.update(1, 0, 1, 10))
+        self.assertFalse(timer.update(0, 2, 1, 10))
+        self.assertFalse(timer.update(1, 3, 1, 10))
+        self.assertTrue(timer.update(1, 10, 1, 10))
+        self.assertFalse(timer.update(1, 11, 1, 10))
+        self.assertFalse(timer.update(0, 12, 1, 10))
+        self.assertFalse(timer.update(0, 13, 1, 10))
+        self.assertFalse(timer.update(0, 14, 1, 10))
+        self.assertFalse(timer.update(1, 15, 1, 10))
+        self.assertTrue(timer.update(1, 25, 1, 10))
 
     def test_person_and_light_do_not_raise_object_alarm(self):
         import cv2
@@ -902,7 +901,31 @@ class AnalyticsTests(TestCase):
             if alarms:
                 break
         self.assertEqual(alarms, ["object_in"])
+        self.assertTrue(monitor.showing_red(now))
         self.assertEqual(monitor.update(placed, points, [], now + 5, 2, True, False), [])
+
+    def test_object_timer_survives_one_miss_and_turns_red(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        base = np.full((200, 280, 3), 100, dtype=np.uint8)
+        placed = base.copy()
+        cv2.rectangle(placed, (90, 50), (190, 150), (240, 240, 240), -1)
+        monitor = FieldMonitor()
+        monitor.update(base, points, [], 0, 10, True, False)
+        self.assertEqual(monitor.update(placed, points, [], 1, 10, True, False), [])
+        self.assertTrue(monitor.watching)
+        self.assertEqual(monitor.update(placed, points, [], 6, 10, True, False), [])
+        self.assertGreaterEqual(monitor.elapsed, 5)
+        self.assertFalse(monitor.showing_red(6))
+        self.assertEqual(monitor.update(base, points, [], 7, 10, True, False), [])
+        self.assertTrue(monitor.watching)
+        self.assertEqual(monitor.update(placed, points, [], 11, 10, True, False), ["object_in"])
+        self.assertTrue(monitor.showing_red(11))
+        self.assertFalse(monitor.showing_red(20))
 
     def test_saved_zone_row_becomes_an_analytics_rule(self):
         import importlib

@@ -16,7 +16,7 @@ from ultralytics import YOLO
 from .classes import COCO_NAMES, DEFAULT_ENABLED, catalog, label_for
 from .count import CrowdTimer, PeopleCounter
 from .dwell import DwellTracker
-from .geom import box_bottom_center, box_iou, foot_point, line_cross, point_in_polygon
+from .geom import box_bottom_center, line_cross, point_in_polygon
 from .rules import PERSON_KINDS
 from .rtsp import ROOT, base_rtsp_url, configured_camera, stream_url
 from .scene import FieldMonitor
@@ -96,17 +96,86 @@ def _draw_line(image, points) -> None:
     if len(points) < 2:
         return
     height, width = image.shape[:2]
-    start = (int(float(points[0][0]) * width), int(float(points[0][1]) * height))
-    end = (int(float(points[1][0]) * width), int(float(points[1][1]) * height))
-    cv2.arrowedLine(image, start, end, (40, 200, 240), 2, tipLength=0.08)
+    x1 = float(points[0][0]) * width
+    y1 = float(points[0][1]) * height
+    x2 = float(points[1][0]) * width
+    y2 = float(points[1][1]) * height
+    cv2.line(image, (int(x1), int(y1)), (int(x2), int(y2)), (40, 200, 240), 2, cv2.LINE_AA)
+    dx, dy = x2 - x1, y2 - y1
+    length = (dx * dx + dy * dy) ** 0.5 or 1.0
+    left_x, left_y = -dy / length, dx / length
+    mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+    reach = max(36, int(height * 0.07))
+    _direction_mark(image, mid_x, mid_y, left_x, left_y, reach, "Forward", (80, 210, 90))
+    _direction_mark(image, mid_x, mid_y, -left_x, -left_y, reach, "Backward", (70, 70, 220))
+
+
+def _direction_mark(image, x: float, y: float, ux: float, uy: float, reach: int, text: str, color) -> None:
+    tip = (int(x + ux * reach), int(y + uy * reach))
+    cv2.arrowedLine(image, (int(x), int(y)), tip, color, 2, tipLength=0.35, line_type=cv2.LINE_AA)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.55, image.shape[0] / 900)
+    cv2.putText(
+        image,
+        text,
+        (tip[0] + 6, tip[1] + 6),
+        font,
+        scale,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def _fill_polygon(image, points, color, alpha: float = 0.35) -> None:
+    if len(points) < 3:
+        return
+    height, width = image.shape[:2]
+    polygon = np.array(
+        [[int(float(x) * width), int(float(y) * height)] for x, y in points],
+        dtype=np.int32,
+    )
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [polygon], color)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+    blended = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0)
+    image[mask > 0] = blended[mask > 0]
+
+
+def _draw_zone_label(image, points, text: str) -> None:
+    if not text or len(points) < 3:
+        return
+    height, width = image.shape[:2]
+    cx = int(sum(float(point[0]) for point in points) / len(points) * width)
+    cy = int(sum(float(point[1]) for point in points) / len(points) * height)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.7, height / 700)
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    left = max(0, cx - text_width // 2)
+    top = max(text_height + 4, cy)
+    cv2.rectangle(
+        image,
+        (left - 6, top - text_height - 6),
+        (left + text_width + 6, top + baseline + 4),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.putText(image, text, (left, top), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def _draw_shapes(image, shapes) -> None:
-    for kind, points in shapes:
+    for shape in shapes:
+        kind, points = shape[0], shape[1]
+        extra = shape[2] if len(shape) > 2 else {}
+        if extra.get("red"):
+            _fill_polygon(image, points, (40, 40, 220), 0.35)
         if kind == "line":
             _draw_line(image, points)
         else:
             _draw_zone(image, points)
+            _draw_zone_label(image, points, extra.get("label", ""))
 
 
 def _draw_captions(image, lines) -> None:
@@ -296,8 +365,6 @@ class Engine:
         self._line_alarmed: dict[int, set] = {}
         self._fields: dict[int, FieldMonitor] = {}
         self._field_stamps: dict[int, str] = {}
-        self._pose_model = None
-        self._pose_name = ""
         self._last_draw: list[tuple] = []
         self._last_shapes: list[tuple] = []
         self._last_captions: list[str] = []
@@ -468,7 +535,7 @@ class Engine:
             return
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # The small model keeps the CPU preview smooth. CUDA can carry the larger one.
-        weight_name = "yolo11m.pt" if device == "cuda" else "yolo11n.pt"
+        weight_name = "yolo11s.pt" if device == "cuda" else "yolo11n.pt"
         imgsz = 640 if device == "cuda" else 480
         with self._lock:
             if generation != self._generation:
@@ -568,18 +635,6 @@ class Engine:
         self._rules_camera = self.camera_number
         return self._rules_cached
 
-    def _ensure_pose(self, device: str):
-        name = "yolo11s-pose.pt" if device == "cuda" else "yolo11n-pose.pt"
-        if self._pose_model is not None and self._pose_name == name:
-            return self._pose_model
-        try:
-            self._pose_model = YOLO(str(ROOT / name))
-            self._pose_name = name
-        except Exception as exc:
-            print("pose load:", type(exc).__name__, exc)
-            self._pose_model = None
-        return self._pose_model
-
     def _publish_preview(self, frame, generation: int) -> None:
         """Show the newest camera frame with the last boxes, without running the model again."""
         if generation != self._generation:
@@ -614,7 +669,7 @@ class Engine:
             results = model.track(
                 frame,
                 persist=True,
-                tracker="botsort.yaml",
+                tracker="bytetrack.yaml",
                 classes=class_ids,
                 imgsz=imgsz,
                 conf=0.30,
@@ -647,22 +702,16 @@ class Engine:
                 shapes.append(("poly", points))
             elif len(points) >= 3 and rule.kind in ("object_in", "object_removed"):
                 object_rules.append(rule)
-                shapes.append(("poly", points))
-        _draw_shapes(plotted, shapes)
 
         person_boxes = []
         for track_id, coords, class_id, _conf in boxes:
             if class_id != 0 or track_id < 0:
                 continue
             person_boxes.append((track_id, coords))
-        need_pose = any(rule is not None for rule in (zone_rule, line_rule, count_rule, crowd_rule))
-        if need_pose and person_boxes:
-            feet = _feet_for_people(self._ensure_pose(device), frame, person_boxes, width, height, device, imgsz)
-        else:
-            feet = {
-                int(track_id): box_bottom_center(coords, width, height)
-                for track_id, coords in person_boxes
-            }
+        feet = {
+            int(track_id): box_bottom_center(coords, width, height)
+            for track_id, coords in person_boxes
+        }
 
         present: dict[int, bool] = {}
         dwell_seconds = 60
@@ -686,12 +735,40 @@ class Engine:
         crowd_hit = False
         if crowd_rule is not None:
             crowd_count = self._count_people(crowd_rule, person_boxes, feet, width, height)
-            captions.append(f"Crowd: {crowd_count}")
             timer = self._crowds.get(crowd_rule.id)
             if timer is None:
                 timer = CrowdTimer()
                 self._crowds[crowd_rule.id] = timer
             crowd_hit = timer.update(crowd_count, now, crowd_rule.max_people, crowd_rule.duration_seconds)
+            if timer.since is not None:
+                captions.append(f"Crowd: {crowd_count}  {int(timer.elapsed)}s")
+            else:
+                captions.append(f"Crowd: {crowd_count}")
+
+        object_events = []
+        for rule in object_rules:
+            stamp = rule.updated_at.isoformat() if rule.updated_at else ""
+            monitor = self._fields.get(rule.id)
+            if monitor is None or self._field_stamps.get(rule.id) != stamp:
+                monitor = FieldMonitor()
+                self._fields[rule.id] = monitor
+                self._field_stamps[rule.id] = stamp
+            object_events.extend(
+                monitor.update(
+                    frame,
+                    rule.points,
+                    [coords for _track_id, coords in person_boxes],
+                    now,
+                    rule.duration_seconds,
+                    rule.kind == "object_in",
+                    rule.kind == "object_removed",
+                )
+            )
+            extra = {"red": monitor.showing_red(now)}
+            if monitor.watching or extra["red"]:
+                extra["label"] = f"{int(monitor.elapsed)} / {int(rule.duration_seconds)}s"
+            shapes.append(("poly", rule.points, extra))
+        _draw_shapes(plotted, shapes)
 
         self._queue_face(generation, frame, person_boxes, now)
 
@@ -745,23 +822,8 @@ class Engine:
             self._raise_alarms(frame, plotted, person_boxes, line_ids, kind="line_cross")
         if crowd_hit:
             self._raise_scene_alarm(plotted, "crowd")
-        for rule in object_rules:
-            stamp = rule.updated_at.isoformat() if rule.updated_at else ""
-            monitor = self._fields.get(rule.id)
-            if monitor is None or self._field_stamps.get(rule.id) != stamp:
-                monitor = FieldMonitor()
-                self._fields[rule.id] = monitor
-                self._field_stamps[rule.id] = stamp
-            for event in monitor.update(
-                frame,
-                rule.points,
-                [coords for _track_id, coords in person_boxes],
-                now,
-                rule.duration_seconds,
-                rule.kind == "object_in",
-                rule.kind == "object_removed",
-            ):
-                self._raise_scene_alarm(plotted, event)
+        for event in object_events:
+            self._raise_scene_alarm(plotted, event)
 
         self._last_draw = draw
         self._last_shapes = shapes
@@ -1127,50 +1189,6 @@ def _inside_map(person_boxes, feet, points, width: int, height: int) -> dict[int
         point = feet.get(int(track_id)) or box_bottom_center(coords, width, height)
         present[int(track_id)] = point_in_polygon(point[0], point[1], polygon)
     return present
-
-
-def _read_pose(result):
-    if result.boxes is None or result.keypoints is None or len(result.boxes) == 0:
-        return [], []
-    return result.boxes.xyxy.cpu().numpy(), result.keypoints.data.cpu().numpy()
-
-
-def _feet_for_people(pose_model, frame, person_boxes, width: int, height: int, device: str, imgsz: int):
-    fallback = {
-        int(track_id): box_bottom_center(coords, width, height)
-        for track_id, coords in person_boxes
-        if track_id >= 0
-    }
-    if pose_model is None or not person_boxes:
-        return fallback
-    try:
-        results = pose_model(frame, conf=0.25, imgsz=imgsz, device=device, verbose=False)
-    except Exception:
-        return fallback
-    if not results:
-        return fallback
-    pose_boxes, keypoints = _read_pose(results[0])
-    if len(pose_boxes) == 0:
-        return fallback
-    used = set()
-    feet = {}
-    for track_id, coords in person_boxes:
-        if track_id < 0:
-            continue
-        best_index = None
-        best_score = 0.25
-        for index, pose_box in enumerate(pose_boxes):
-            if index in used:
-                continue
-            score = box_iou(coords, pose_box)
-            if score > best_score:
-                best_score = score
-                best_index = index
-        chosen = keypoints[best_index] if best_index is not None else None
-        if best_index is not None:
-            used.add(best_index)
-        feet[int(track_id)] = foot_point(coords, chosen, width, height)
-    return feet
 
 
 def _read_boxes(result) -> list[tuple]:
