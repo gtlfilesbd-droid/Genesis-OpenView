@@ -351,6 +351,7 @@ class Engine:
         self.detections: list[dict] = []
         self.people_count = None
         self.crowd_count = None
+        self.timers: list[dict] = []
         self.enabled_classes = set(DEFAULT_ENABLED)
         self.latest_jpeg = b""
         self.raw_jpeg = b""
@@ -423,6 +424,7 @@ class Engine:
             self.detections = []
             self.people_count = None
             self.crowd_count = None
+            self.timers = []
             self.latest_jpeg = b""
             self.channel = ""
         self._warm_faces()
@@ -444,6 +446,7 @@ class Engine:
             self.detections = []
             self.people_count = None
             self.crowd_count = None
+            self.timers = []
             self.latest_jpeg = b""
             self.raw_jpeg = b""
 
@@ -486,6 +489,7 @@ class Engine:
                 "detections": list(self.detections),
                 "people_count": self.people_count,
                 "crowd_count": self.crowd_count,
+                "timers": list(self.timers),
                 "enabled": set(self.enabled_classes),
                 "alarm": alarm,
             }
@@ -727,6 +731,7 @@ class Engine:
             line_ids = self._cross_line(line_rule, feet)
 
         captions = []
+        timers = []
         people_count = None
         if count_rule is not None:
             people_count = self._count_people(count_rule, person_boxes, feet, width, height)
@@ -742,8 +747,10 @@ class Engine:
             crowd_hit = timer.update(crowd_count, now, crowd_rule.max_people, crowd_rule.duration_seconds)
             if timer.since is not None:
                 captions.append(f"Crowd: {crowd_count}  {int(timer.elapsed)}s")
+                timers.append({"label": "Crowd detection", "text": f"{int(timer.elapsed)}s"})
             else:
                 captions.append(f"Crowd: {crowd_count}")
+                timers.append({"label": "Crowd detection", "text": "0s"})
 
         object_events = []
         for rule in object_rules:
@@ -765,9 +772,16 @@ class Engine:
                 )
             )
             extra = {"red": monitor.showing_red(now)}
+            timer_text = f"{int(monitor.elapsed) if monitor.watching or extra['red'] else 0} / {int(rule.duration_seconds)}s"
             if monitor.watching or extra["red"]:
-                extra["label"] = f"{int(monitor.elapsed)} / {int(rule.duration_seconds)}s"
+                extra["label"] = timer_text
             shapes.append(("poly", rule.points, extra))
+            timers.append(
+                {
+                    "label": "Object in field" if rule.kind == "object_in" else "Remove object",
+                    "text": timer_text,
+                }
+            )
         _draw_shapes(plotted, shapes)
 
         self._queue_face(generation, frame, person_boxes, now)
@@ -840,6 +854,7 @@ class Engine:
             self.detections = detections
             self.people_count = people_count
             self.crowd_count = crowd_count
+            self.timers = timers
             if ok:
                 self.latest_jpeg = encoded.tobytes()
             if ok_raw:

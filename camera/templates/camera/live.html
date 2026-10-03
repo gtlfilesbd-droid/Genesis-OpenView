@@ -34,7 +34,7 @@
     <p id="meta" class="muted">Camera stopped</p>
     <p id="error" class="error"></p>
     <table>
-      <thead><tr><th>Object</th><th>Name</th><th>Confidence</th><th>Zone</th></tr></thead>
+      <thead><tr><th>Object</th><th>Name</th><th>Confidence</th><th>Timer</th></tr></thead>
       <tbody id="detections"></tbody>
     </table>
   </aside>
@@ -92,12 +92,25 @@ async function tick() {
     const objectCell = document.createElement("td");
     const nameCell = document.createElement("td");
     const confidenceCell = document.createElement("td");
-    const zoneCell = document.createElement("td");
+    const timerCell = document.createElement("td");
     objectCell.textContent = item.label;
     nameCell.textContent = item.name ? (item.list ? item.name + " · " + item.list : item.name) : "—";
     confidenceCell.textContent = Math.round(item.confidence * 100) + "%";
-    zoneCell.textContent = item.class_id === 0 && item.inside ? item.dwell + "s" : "—";
-    row.append(objectCell, nameCell, confidenceCell, zoneCell);
+    timerCell.textContent = item.class_id === 0 && item.inside ? item.dwell + "s" : "—";
+    row.append(objectCell, nameCell, confidenceCell, timerCell);
+    detections.append(row);
+  }
+  for (const timer of data.timers || []) {
+    const row = document.createElement("tr");
+    const objectCell = document.createElement("td");
+    const nameCell = document.createElement("td");
+    const confidenceCell = document.createElement("td");
+    const timerCell = document.createElement("td");
+    objectCell.textContent = timer.label;
+    nameCell.textContent = "—";
+    confidenceCell.textContent = "—";
+    timerCell.textContent = timer.text;
+    row.append(objectCell, nameCell, confidenceCell, timerCell);
     detections.append(row);
   }
   if (data.alarm && data.alarm.active) {
