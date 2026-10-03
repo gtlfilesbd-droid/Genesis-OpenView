@@ -366,6 +366,7 @@ class Engine:
         self._line_alarmed: dict[int, set] = {}
         self._fields: dict[int, FieldMonitor] = {}
         self._field_stamps: dict[int, str] = {}
+        self._zone_red_until = 0.0
         self._last_draw: list[tuple] = []
         self._last_shapes: list[tuple] = []
         self._last_captions: list[str] = []
@@ -414,6 +415,7 @@ class Engine:
         self._line_alarmed = {}
         self._fields = {}
         self._field_stamps = {}
+        self._zone_red_until = 0.0
         with self._lock:
             self.camera_number = int(camera_number)
             self.stream = stream if stream in ("sub", "main") else "sub"
@@ -697,7 +699,6 @@ class Engine:
                 shapes.append(("line", points[:2]))
             elif len(points) >= 3 and rule.kind == "zone":
                 zone_rule = rule
-                shapes.append(("poly", points))
             elif len(points) >= 3 and rule.kind == "people_count":
                 count_rule = rule
                 shapes.append(("poly", points))
@@ -725,6 +726,10 @@ class Engine:
         if zone_rule is None:
             present = {}
         alarm_ids = self._dwell.update(present, now, dwell_seconds)
+        if zone_rule is not None:
+            if alarm_ids:
+                self._zone_red_until = now + 8
+            shapes.append(("poly", zone_rule.points, {"red": now < self._zone_red_until}))
 
         line_ids = []
         if line_rule is not None:
