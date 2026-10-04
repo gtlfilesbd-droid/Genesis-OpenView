@@ -1449,3 +1449,31 @@ class PortalAccessTests(TestCase):
         self.assertContains(page, "Use a JPEG, PNG, or WEBP picture.")
         account = get_user_model().objects.get(username="user")
         self.assertFalse(account.profile.avatar)
+
+
+class StreamReleaseTests(TestCase):
+    def test_stream_closes_the_database_before_the_next_frame(self):
+        from unittest.mock import patch
+
+        from django.test import RequestFactory
+
+        from camera.services.engine import engine
+        from camera.views import stream
+
+        class StopStream(Exception):
+            pass
+
+        request = RequestFactory().get("/stream/")
+        request.user = get_user_model().objects.get(username="admin")
+        with (
+            patch("camera.views.close_old_connections") as closed,
+            patch("camera.views.time.sleep", side_effect=StopStream),
+            patch.object(engine, "current_jpeg", return_value=b"frame"),
+        ):
+            response = stream(request)
+            frames = iter(response.streaming_content)
+            chunk = next(frames)
+            self.assertIn(b"frame", chunk)
+            closed.assert_called_once()
+            with self.assertRaises(StopStream):
+                next(frames)

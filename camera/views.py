@@ -7,7 +7,7 @@ from django.contrib import messages
 from django.contrib.auth import authenticate, get_user_model, login, logout, update_session_auth_hash
 from django.core.files.base import ContentFile
 from django.core.paginator import Paginator
-from django.db import IntegrityError
+from django.db import IntegrityError, close_old_connections
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -119,6 +119,7 @@ def live(request):
 @require_feature("live")
 def stream(request):
     def frames():
+        close_old_connections()
         while True:
             jpeg = engine.current_jpeg()
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"

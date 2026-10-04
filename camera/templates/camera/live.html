@@ -66,7 +66,11 @@ function beep() {
   oscillator.stop(context.currentTime + 0.35);
 }
 
+let statusBusy = false;
 async function tick() {
+  if (statusBusy) return;
+  statusBusy = true;
+  try {
   const response = await fetch("{% url 'status' %}");
   const data = await response.json();
   const state = data.running ? "Live" : (data.starting ? "Reconnecting" : "Stopped");
@@ -124,6 +128,9 @@ async function tick() {
     }
   } else {
     banner.hidden = true;
+  }
+  } finally {
+    statusBusy = false;
   }
 }
 
