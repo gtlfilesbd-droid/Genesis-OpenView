@@ -1022,6 +1022,121 @@ class AnalyticsTests(TestCase):
                 break
         self.assertEqual(alarms, ["object_in"])
 
+    def test_shifted_return_stops_the_remove_timer(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        present = np.full((200, 280, 3), 100, dtype=np.uint8)
+        cv2.rectangle(present, (60, 40), (150, 130), (20, 20, 20), -1)
+        empty = np.full_like(present, 100)
+        shifted = empty.copy()
+        cv2.rectangle(shifted, (66, 44), (156, 134), (20, 20, 20), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(present, points, [], 0, 3, False, True), [])
+        alarms = []
+        now = 1.0
+        for _frame in range(10):
+            alarms = monitor.update(empty, points, [], now, 3, False, True)
+            now += 0.5
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_removed"])
+        for _frame in range(6):
+            monitor.update(shifted, points, [], now, 3, False, True)
+            now += 0.5
+            if not monitor.watching and monitor.elapsed == 0:
+                break
+        self.assertFalse(monitor.watching)
+        self.assertEqual(monitor.elapsed, 0)
+        self.assertFalse(monitor.showing_red(now))
+        for _frame in range(4):
+            self.assertEqual(monitor.update(shifted, points, [], now, 3, False, True), [])
+            self.assertFalse(monitor.watching)
+            self.assertEqual(monitor.elapsed, 0)
+            now += 0.5
+
+    def test_shifted_return_before_the_wait_stops_the_timer(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        present = np.full((200, 280, 3), 100, dtype=np.uint8)
+        cv2.rectangle(present, (60, 40), (150, 130), (20, 20, 20), -1)
+        empty = np.full_like(present, 100)
+        shifted = empty.copy()
+        cv2.rectangle(shifted, (66, 44), (156, 134), (20, 20, 20), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(present, points, [], 0, 10, False, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 1, 10, False, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 2.2, 10, False, True), [])
+        self.assertTrue(monitor.watching)
+        self.assertEqual(monitor.update(shifted, points, [], 3, 10, False, True), [])
+        self.assertEqual(monitor.update(shifted, points, [], 4.1, 10, False, True), [])
+        self.assertFalse(monitor.watching)
+        self.assertEqual(monitor.elapsed, 0)
+        self.assertEqual(monitor.update(shifted, points, [], 5, 10, False, True), [])
+        self.assertFalse(monitor.watching)
+        self.assertEqual(monitor.elapsed, 0)
+
+    def test_exact_restoration_clears_the_remove_timer(self):
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        present = np.full((200, 280, 3), 90, dtype=np.uint8)
+        present[40:160, 70:190] = 15
+        empty = np.full_like(present, 90)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(present, points, [], 0, 3, False, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 1, 3, False, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 4, 3, False, True), ["object_removed"])
+        now = 5.0
+        for _frame in range(8):
+            monitor.update(present, points, [], now, 3, False, True)
+            now += 0.25
+        self.assertFalse(monitor.watching)
+        self.assertEqual(monitor.elapsed, 0)
+        self.assertFalse(monitor.showing_red(now))
+
+    def test_removing_a_placed_object_stops_the_timer(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        empty = np.full((200, 280, 3), 100, dtype=np.uint8)
+        placed = empty.copy()
+        cv2.rectangle(placed, (70, 40), (170, 140), (230, 230, 230), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(empty, points, [], 0, 2, True, False), [])
+        alarms = []
+        now = 1.0
+        for _frame in range(10):
+            alarms = monitor.update(placed, points, [], now, 2, True, False)
+            now += 0.5
+            if alarms:
+                break
+        self.assertEqual(alarms, ["object_in"])
+        for _frame in range(6):
+            monitor.update(empty, points, [], now, 2, True, False)
+            now += 0.5
+            if not monitor.watching and monitor.elapsed == 0:
+                break
+        self.assertFalse(monitor.watching)
+        self.assertEqual(monitor.elapsed, 0)
+        for _frame in range(4):
+            self.assertEqual(monitor.update(empty, points, [], now, 2, True, False), [])
+            self.assertFalse(monitor.watching)
+            self.assertEqual(monitor.elapsed, 0)
+            now += 0.5
+
     def test_saved_zone_row_becomes_an_analytics_rule(self):
         import importlib
 

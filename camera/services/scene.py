@@ -12,6 +12,7 @@ PERSON_MASK_CONF = 0.55
 SCENE_LONG_SIDE = 480
 RED_HOLD = 8.0
 MISS_LIMIT = 6
+RETURN_SETTLE = 1.0
 
 
 def polygon_mask(height: int, width: int, points) -> np.ndarray:
@@ -111,8 +112,11 @@ class FieldMonitor:
     """Stationary object appear and disappear inside a polygon.
 
     Each still spot keeps its own clock. A larger change elsewhere in the zone
-    can move without resetting that clock. A brightness jump across the zone is
-    a light change and does not alarm. People boxes are ignored.
+    can move without resetting that clock. Once that spot has been still for a
+    second, a later settled change means the object came back or was taken
+    away: the timer stops and that picture becomes the new reference. A
+    brightness jump across the zone is a light change and does not alarm.
+    People boxes are ignored.
     """
 
     def __init__(self) -> None:
@@ -171,7 +175,7 @@ class FieldMonitor:
             return []
         quiet = (cv2.absdiff(gray, self.long_term) < 12) & (mask > 0)
         self.long_term[quiet] = gray[quiet]
-        return self._track("in", blobs, now, duration, "object_in")
+        return self._track("in", blobs, now, duration, "object_in", gray, mask, self.long_term)
 
     def _removed(self, gray, mask, now, duration):
         blobs, global_light = local_blobs(gray, self.armed, mask)
@@ -179,9 +183,40 @@ class FieldMonitor:
             self.armed[mask > 0] = gray[mask > 0]
             self._clear("out")
             return []
-        return self._track("out", blobs, now, duration, "object_removed")
+        return self._track("out", blobs, now, duration, "object_removed", gray, mask, self.armed)
 
-    def _track(self, which: str, blobs, now: float, duration: float, kind: str):
+    def _remember_gap(self, tracks, now: float, gray) -> None:
+        for track in tracks:
+            if track["misses"] != 0 or track.get("gap") is not None:
+                continue
+            if now - track["since"] >= RETURN_SETTLE:
+                track["gap"] = gray.copy()
+                track["return_since"] = None
+
+    def _returned(self, which: str, tracks, now: float, gray, mask, reference) -> bool:
+        for track in tracks:
+            gap = track.get("gap")
+            if gap is None:
+                continue
+            returned, global_light = local_blobs(gray, gap, mask)
+            if global_light:
+                continue
+            spot = [blob for blob in returned if _same_spot(track["center"], blob["center"])]
+            if not spot:
+                track["return_since"] = None
+                continue
+            track["misses"] = 0
+            if track["return_since"] is None:
+                track["return_since"] = now
+                continue
+            if now - track["return_since"] < RETURN_SETTLE:
+                continue
+            reference[mask > 0] = gray[mask > 0]
+            self._clear(which)
+            return True
+        return False
+
+    def _track(self, which: str, blobs, now: float, duration: float, kind: str, gray, mask, reference):
         tracks = getattr(self, f"{which}_tracks")
         used = set()
         for track in tracks:
@@ -201,6 +236,9 @@ class FieldMonitor:
                 tracks.append({"center": blob["center"], "since": now, "alarmed": False, "misses": 0})
         kept = [track for track in tracks if track["misses"] < MISS_LIMIT]
         tracks[:] = kept
+        self._remember_gap(tracks, now, gray)
+        if self._returned(which, tracks, now, gray, mask, reference):
+            return []
         if not tracks:
             self._clear(which)
             return []
@@ -232,3 +270,4 @@ class FieldMonitor:
         setattr(self, f"{which}_tracks", [])
         self.elapsed = 0.0
         self.watching = False
+        self.red_until = 0.0
