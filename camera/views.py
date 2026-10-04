@@ -165,7 +165,7 @@ _ANALYTICS_HINTS = {
     "zone": "Click the area corners. A person is inside when an ankle, or the bottom of the box, is in the shape.",
     "line_cross": "Click the start and end of the line. The arrow is forward. A person alarms when they cross in the chosen direction.",
     "object_in": "Click the area corners. An alarm fires after something new stays in the area for the wait. People walking through are ignored.",
-    "object_removed": "Click the area corners. An alarm fires if something that was in the area is gone for the wait.",
+    "object_removed": "Click the area corners. Choose a picture change, or an alarm only after the whole object has left the area.",
     "people_count": "Click the area corners. The live view shows how many people are standing in the shape.",
     "crowd": "Click the area corners. An alarm fires when this many people stay in the area for the wait.",
 }
@@ -217,7 +217,10 @@ def analytics(request):
                 max_people = 5
             max_people = min(500, max(1, max_people))
             coverage = request.POST.get("coverage", AnalyticsRule.TOUCH)
-            if kind in (AnalyticsRule.OBJECT_IN, AnalyticsRule.OBJECT_REMOVED):
+            if kind == AnalyticsRule.OBJECT_REMOVED:
+                if coverage not in dict(AnalyticsRule.REMOVE_COVERAGE):
+                    coverage = AnalyticsRule.TOUCH
+            elif kind == AnalyticsRule.OBJECT_IN:
                 coverage = AnalyticsRule.TOUCH
             elif coverage not in dict(AnalyticsRule.COVERAGE):
                 coverage = AnalyticsRule.TOUCH
@@ -254,8 +257,10 @@ def analytics(request):
             "needs_people": kind == AnalyticsRule.CROWD,
             "is_line": kind == AnalyticsRule.LINE_CROSS,
             "needs_coverage": kind in (AnalyticsRule.ZONE, AnalyticsRule.PEOPLE_COUNT, AnalyticsRule.CROWD),
+            "needs_remove_coverage": kind == AnalyticsRule.OBJECT_REMOVED,
             "coverage": saved.coverage if saved else AnalyticsRule.TOUCH,
             "coverages": [{"id": key, "label": label} for key, label in AnalyticsRule.COVERAGE],
+            "remove_coverages": [{"id": key, "label": label} for key, label in AnalyticsRule.REMOVE_COVERAGE],
             "direction": saved.direction if saved else AnalyticsRule.ANY,
             "directions": [{"id": key, "label": label} for key, label in AnalyticsRule.DIRECTIONS],
             "max_people": saved.max_people if saved else 5,

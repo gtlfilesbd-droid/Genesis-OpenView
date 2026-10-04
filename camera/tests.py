@@ -910,6 +910,92 @@ class AnalyticsTests(AdminClientMixin, TestCase):
         self.assertEqual(monitor.update(empty, points, [], 1, 3, False, True), [])
         self.assertEqual(monitor.update(empty, points, [], 4, 3, False, True), ["object_removed"])
 
+    def test_outside_mode_ignores_a_slide_that_stays_inside(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        armed = np.full((200, 280, 3), 90, dtype=np.uint8)
+        cv2.rectangle(armed, (40, 40), (100, 120), (15, 15, 15), -1)
+        slid = np.full_like(armed, 90)
+        cv2.rectangle(slid, (150, 40), (210, 120), (15, 15, 15), -1)
+        monitor = FieldMonitor()
+        self.assertEqual(monitor.update(armed, points, [], 0, 3, False, True, True), [])
+        self.assertEqual(monitor.update(slid, points, [], 1, 3, False, True, True), [])
+        self.assertEqual(monitor.update(slid, points, [], 4, 3, False, True, True), [])
+        self.assertFalse(monitor.watching)
+
+    def test_outside_mode_alarms_when_the_block_leaves(self):
+        import cv2
+        import numpy as np
+
+        from camera.services.scene import FieldMonitor
+
+        points = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]]
+        armed = np.full((200, 280, 3), 90, dtype=np.uint8)
+        cv2.rectangle(armed, (40, 40), (100, 120), (15, 15, 15), -1)
+        slid = np.full_like(armed, 90)
+        cv2.rectangle(slid, (150, 40), (210, 120), (15, 15, 15), -1)
+        empty = np.full_like(armed, 90)
+        monitor = FieldMonitor()
+        monitor.update(armed, points, [], 0, 3, False, True, True)
+        self.assertEqual(monitor.update(slid, points, [], 1, 3, False, True, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 2, 3, False, True, True), [])
+        self.assertEqual(monitor.update(empty, points, [], 5, 3, False, True, True), ["object_removed"])
+
+    def test_remove_rule_without_a_choice_stays_on_picture_change(self):
+        from camera.models import AnalyticsRule
+
+        response = self.client.post(
+            "/analytics/",
+            {
+                "camera": 6,
+                "stream": "main",
+                "kind": "object_removed",
+                "points": "[[0,0],[1,0],[0.2,1]]",
+                "minutes": 0,
+                "seconds": 10,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        rule = AnalyticsRule.objects.get(camera_number=6, kind="object_removed")
+        self.assertEqual(rule.coverage, AnalyticsRule.TOUCH)
+        page = self.client.get("/analytics/?camera=6&kind=object_removed")
+        self.assertContains(page, "Area picture changes")
+        self.assertContains(page, "Whole object outside the area")
+        self.client.post(
+            "/analytics/",
+            {
+                "camera": 6,
+                "stream": "main",
+                "kind": "object_removed",
+                "points": "[[0,0],[1,0],[0.2,1]]",
+                "minutes": 0,
+                "seconds": 10,
+                "coverage": "outside",
+            },
+        )
+        rule.refresh_from_db()
+        self.assertEqual(rule.coverage, AnalyticsRule.OUTSIDE)
+        zone = self.client.get("/analytics/?camera=6&kind=zone")
+        self.assertNotContains(zone, "Whole object outside the area")
+        self.client.post(
+            "/analytics/",
+            {
+                "camera": 6,
+                "stream": "main",
+                "kind": "object_in",
+                "points": "[[0,0],[1,0],[0.2,1]]",
+                "minutes": 0,
+                "seconds": 10,
+                "coverage": "outside",
+            },
+        )
+        placed = AnalyticsRule.objects.get(camera_number=6, kind="object_in")
+        self.assertEqual(placed.coverage, AnalyticsRule.TOUCH)
+
     def test_placed_object_alarms_once_it_stays(self):
         import cv2
         import numpy as np

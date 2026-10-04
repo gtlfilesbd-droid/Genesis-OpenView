@@ -47,16 +47,21 @@ class AnalyticsRule(models.Model):
     )
     TOUCH = "touch"
     INSIDE = "inside"
+    OUTSIDE = "outside"
     COVERAGE = (
         (TOUCH, "Any part in the area"),
         (INSIDE, "Whole object inside the area"),
+    )
+    REMOVE_COVERAGE = (
+        (TOUCH, "Area picture changes"),
+        (OUTSIDE, "Whole object outside the area"),
     )
 
     camera_number = models.PositiveIntegerField()
     kind = models.CharField(max_length=32, choices=KINDS)
     points = models.JSONField(default=list)
     direction = models.CharField(max_length=16, choices=DIRECTIONS, default=ANY)
-    coverage = models.CharField(max_length=16, choices=COVERAGE, default=TOUCH)
+    coverage = models.CharField(max_length=16, choices=(*COVERAGE, REMOVE_COVERAGE[1]), default=TOUCH)
     duration_seconds = models.PositiveIntegerField(default=60)
     max_people = models.PositiveIntegerField(default=5)
     active = models.BooleanField(default=True)

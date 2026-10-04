@@ -12,6 +12,8 @@ PERSON_MASK_CONF = 0.55
 SCENE_LONG_SIDE = 480
 RED_HOLD = 8.0
 MISS_LIMIT = 6
+PATCH_MATCH = 0.55
+PATCH_MARGIN = 0.15
 
 
 def polygon_mask(height: int, width: int, points) -> np.ndarray:
@@ -67,6 +69,43 @@ def _same_spot(origin, center) -> bool:
     return (center[0] - origin[0]) ** 2 + (center[1] - origin[1]) ** 2 <= CENTER_TOLERANCE**2
 
 
+def _object_still_inside(armed, current, blobs, mask) -> bool:
+    if len(blobs) >= 2:
+        return True
+    if len(blobs) != 1:
+        return False
+    return _patch_elsewhere(armed, current, blobs[0], mask)
+
+
+def _patch_elsewhere(armed, current, blob, mask) -> bool:
+    x, y, width, height = blob["box"]
+    if width < 8 or height < 8:
+        return False
+    if y + height > armed.shape[0] or x + width > armed.shape[1]:
+        return False
+    if current.shape[0] < height or current.shape[1] < width:
+        return False
+    patch = armed[y : y + height, x : x + width]
+    scores = cv2.matchTemplate(current, patch, cv2.TM_CCOEFF_NORMED)
+    scores = np.nan_to_num(scores, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    y0 = max(0, y - height // 4)
+    y1 = min(scores.shape[0], y + height // 4 + 1)
+    x0 = max(0, x - width // 4)
+    x1 = min(scores.shape[1], x + width // 4 + 1)
+    scores[y0:y1, x0:x1] = -1.0
+    _lowest, best, _low_at, best_at = cv2.minMaxLoc(scores)
+    if not np.isfinite(best) or best < PATCH_MATCH:
+        return False
+    finite = scores[np.isfinite(scores)]
+    if finite.size == 0 or best - float(np.percentile(finite, 90)) < PATCH_MARGIN:
+        return False
+    match_x, match_y = best_at
+    window = mask[match_y : match_y + height, match_x : match_x + width]
+    if window.size == 0:
+        return False
+    return int(np.count_nonzero(window)) / window.size >= 0.5
+
+
 def local_blobs(current: np.ndarray, reference: np.ndarray, mask: np.ndarray):
     changed = changed_mask(current, reference, mask)
     if is_global_change(changed, mask):
@@ -85,7 +124,8 @@ def local_blobs(current: np.ndarray, reference: np.ndarray, mask: np.ndarray):
         if moments["m00"] == 0:
             continue
         center = (moments["m10"] / moments["m00"] / width, moments["m01"] / moments["m00"] / height)
-        found.append({"center": center, "area": area})
+        x, y, box_w, box_h = cv2.boundingRect(contour)
+        found.append({"center": center, "area": area, "box": (x, y, box_w, box_h)})
     return found, False
 
 
@@ -144,6 +184,7 @@ class FieldMonitor:
         duration: float,
         want_in: bool,
         want_removed: bool,
+        outside: bool = False,
     ):
         frame, person_boxes = _fit_scene(frame, person_boxes)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -160,7 +201,7 @@ class FieldMonitor:
         if want_in:
             alarms.extend(self._appear(gray, mask, now, duration))
         if want_removed and self.armed is not None:
-            alarms.extend(self._removed(gray, mask, now, duration))
+            alarms.extend(self._removed(gray, mask, now, duration, outside))
         return alarms
 
     def _appear(self, gray, mask, now, duration):
@@ -173,10 +214,13 @@ class FieldMonitor:
         self.long_term[quiet] = gray[quiet]
         return self._track("in", blobs, now, duration, "object_in")
 
-    def _removed(self, gray, mask, now, duration):
+    def _removed(self, gray, mask, now, duration, outside=False):
         blobs, global_light = local_blobs(gray, self.armed, mask)
         if global_light:
             self.armed[mask > 0] = gray[mask > 0]
+            self._clear("out")
+            return []
+        if outside and _object_still_inside(self.armed, gray, blobs, mask):
             self._clear("out")
             return []
         return self._track("out", blobs, now, duration, "object_removed")
