@@ -1,15 +1,36 @@
 import ipaddress
 import json
 import time
+from datetime import timedelta
 
 from django.contrib import messages
+from django.contrib.auth import authenticate, get_user_model, login, logout, update_session_auth_hash
 from django.core.files.base import ContentFile
 from django.core.paginator import Paginator
+from django.db import IntegrityError
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
+from .access import (
+    FEATURES,
+    allowed_features,
+    apply_avatar,
+    clean_avatar,
+    clean_username,
+    initial_for,
+    is_last_active_staff,
+    public_media_url,
+    password_problem,
+    profile_for,
+    replace_grants,
+    require_feature,
+    require_login,
+    require_staff,
+)
 from .models import Alarm, AnalyticsRule, FaceCapture, Nvr, Person, PersonSample
 from .services.rules import DURATION_KINDS, total_seconds
 from .services.rtsp import configured_camera, env_nvr_fields, stream_url
@@ -85,6 +106,7 @@ def _list_status(value: str) -> str:
     return ""
 
 
+@require_feature("live")
 def live(request):
     engine.ensure_defaults()
     return render(
@@ -94,6 +116,7 @@ def live(request):
     )
 
 
+@require_feature("live")
 def stream(request):
     def frames():
         while True:
@@ -106,11 +129,13 @@ def stream(request):
     return response
 
 
+@require_feature("live", json=True)
 def status(request):
     engine.ensure_defaults()
     return JsonResponse(engine.status())
 
 
+@require_feature("live")
 @require_POST
 def control(request):
     engine.ensure_defaults()
@@ -124,6 +149,7 @@ def control(request):
     return redirect("live")
 
 
+@require_feature("live", json=True)
 @require_POST
 def objects(request):
     try:
@@ -144,6 +170,7 @@ _ANALYTICS_HINTS = {
 }
 
 
+@require_feature("analytics")
 def zone(request):
     camera = request.GET.get("camera") or request.POST.get("camera") or ""
     stream_name = request.GET.get("stream") or request.POST.get("stream") or ""
@@ -155,6 +182,7 @@ def zone(request):
     return redirect(f"/analytics/?{query}")
 
 
+@require_feature("analytics")
 def analytics(request):
     engine.ensure_defaults()
     camera = _camera_number(request.GET.get("camera"), engine.camera_number)
@@ -236,6 +264,7 @@ def analytics(request):
     )
 
 
+@require_feature("analytics")
 def zone_frame(request):
     engine.ensure_defaults()
     camera = _camera_number(request.GET.get("camera"), engine.camera_number)
@@ -284,11 +313,13 @@ def _recognition_redirect(request):
     return redirect("recognition")
 
 
+@require_feature("alarms")
 def alarms(request):
     alarms, page_numbers = _page(request, Alarm.objects.defer("face_embedding"), ALARM_PAGE_SIZE)
     return render(request, "camera/alarms.html", {"alarms": alarms, "page_numbers": page_numbers})
 
 
+@require_feature("recognition")
 def recognition(request):
     captures, page_numbers = _page(
         request,
@@ -311,6 +342,7 @@ def _add_capture_sample(person, capture) -> None:
     add_sample(person, payload, vector, f"{capture.pk}.jpg")
 
 
+@require_feature("recognition")
 @require_POST
 def capture_classify(request, pk):
     from .services.captures import link_same_face
@@ -350,6 +382,7 @@ def capture_classify(request, pk):
     return _recognition_redirect(request)
 
 
+@require_feature("recognition")
 @require_POST
 def capture_sample(request, pk):
     from .services.gallery import sample_skip_reason
@@ -398,6 +431,7 @@ def _embed_upload(upload):
     return payload, embedding
 
 
+@require_feature("people")
 def people(request):
     if request.method == "POST":
         name = (request.POST.get("name") or "").strip()
@@ -428,12 +462,14 @@ def people(request):
     return render(request, "camera/people.html", {"people": enrolled})
 
 
+@require_feature("people")
 @require_POST
 def person_delete(request, pk):
     get_object_or_404(Person, pk=pk).delete()
     return redirect("people")
 
 
+@require_feature("people")
 @require_POST
 def person_list(request, pk):
     person = get_object_or_404(Person, pk=pk)
@@ -448,6 +484,7 @@ def person_list(request, pk):
     return redirect("people")
 
 
+@require_feature("people")
 @require_POST
 def person_samples(request, pk):
     person = get_object_or_404(Person, pk=pk)
@@ -467,6 +504,7 @@ def person_samples(request, pk):
     return redirect("people")
 
 
+@require_feature("people")
 @require_POST
 def sample_delete(request, pk, sample_pk):
     person = get_object_or_404(Person, pk=pk)
@@ -486,6 +524,7 @@ def sample_delete(request, pk, sample_pk):
     return redirect("people")
 
 
+@require_feature("settings")
 def settings(request):
     nvr = Nvr.objects.order_by("pk").first()
     if nvr is not None:
@@ -552,6 +591,7 @@ def settings(request):
     )
 
 
+@require_feature("search")
 def search(request):
     found = None
     error = ""
@@ -589,3 +629,203 @@ def search(request):
                 alarm_scores.sort(key=lambda item: item["score"], reverse=True)
                 found = {"people": people_scores, "alarms": alarm_scores}
     return render(request, "camera/search.html", {"found": found, "error": error})
+
+
+def _next_url(request) -> str:
+    candidate = request.POST.get("next") or request.GET.get("next") or ""
+    if url_has_allowed_host_and_scheme(candidate, allowed_hosts={request.get_host()}):
+        return candidate
+    return reverse("portal")
+
+
+def login_view(request):
+    if request.user.is_authenticated and request.user.is_active:
+        return redirect("portal")
+    error = ""
+    if request.method == "POST":
+        username = request.POST.get("username", "").strip()
+        password = request.POST.get("password", "")
+        account = authenticate(request, username=username, password=password)
+        if account is None:
+            error = "Those details were not recognised."
+        else:
+            login(request, account)
+            return redirect(_next_url(request))
+    return render(
+        request,
+        "camera/login.html",
+        {"error": error, "next": request.GET.get("next", "")},
+    )
+
+
+@require_POST
+def logout_view(request):
+    logout(request)
+    return redirect("login")
+
+
+@require_login
+def portal(request):
+    features = allowed_features(request.user)
+    recent_alarms = None
+    if any(item["code"] == "alarms" for item in features):
+        since = timezone.now() - timedelta(hours=24)
+        recent_alarms = Alarm.objects.filter(created_at__gte=since).count()
+    return render(
+        request,
+        "camera/portal.html",
+        {"features": features, "recent_alarms": recent_alarms},
+    )
+
+
+def _user_rows():
+    rows = []
+    accounts = get_user_model().objects.order_by("username").prefetch_related("feature_grants")
+    for account in accounts:
+        profile = profile_for(account)
+        rows.append(
+            {
+                "account": account,
+                "profile": profile,
+                "avatar_url": public_media_url(profile.avatar),
+                "initial": initial_for(account),
+                "granted": {grant.feature for grant in account.feature_grants.all()},
+                "last_staff": is_last_active_staff(account),
+            }
+        )
+    return rows
+
+
+def _create_account(request):
+    User = get_user_model()
+    username, problem = clean_username(request.POST.get("username", ""))
+    if problem:
+        messages.error(request, problem)
+        return
+    if User.objects.filter(username=username).exists():
+        messages.error(request, "That username is already in use.")
+        return
+    password = request.POST.get("password", "")
+    problem = password_problem(password, User(username=username))
+    if problem:
+        messages.error(request, problem)
+        return
+    upload = request.FILES.get("avatar")
+    if upload is not None:
+        problem = clean_avatar(upload)
+        if problem:
+            messages.error(request, problem)
+            return
+    try:
+        account = User.objects.create_user(
+            username=username,
+            password=password,
+            is_staff=request.POST.get("is_staff") == "on",
+            is_active=True,
+        )
+    except IntegrityError:
+        messages.error(request, "That username is already in use.")
+        return
+    replace_grants(account, request.POST.getlist("features"))
+    if upload is not None:
+        apply_avatar(profile_for(account), upload=upload)
+    messages.success(request, f"Created {username}.")
+
+
+def _save_account(request):
+    User = get_user_model()
+    raw = request.POST.get("user_id")
+    try:
+        account = User.objects.get(pk=int(raw))
+    except (TypeError, ValueError, User.DoesNotExist):
+        messages.error(request, "That account was not found.")
+        return
+    wants_staff = request.POST.get("is_staff") == "on"
+    wants_active = request.POST.get("is_active") == "on"
+    if is_last_active_staff(account) and (not wants_staff or not wants_active):
+        messages.error(request, "The last admin has to stay an active admin.")
+        return
+    password = request.POST.get("password", "")
+    if password:
+        problem = password_problem(password, account)
+        if problem:
+            messages.error(request, problem)
+            return
+    upload = request.FILES.get("avatar")
+    remove = request.POST.get("remove_avatar") == "on"
+    if upload is not None:
+        problem = clean_avatar(upload)
+        if problem:
+            messages.error(request, problem)
+            return
+    account.is_staff = wants_staff
+    account.is_active = wants_active
+    if password:
+        account.set_password(password)
+    account.save()
+    replace_grants(account, request.POST.getlist("features"))
+    profile = profile_for(account)
+    if upload is not None:
+        apply_avatar(profile, upload=upload)
+    elif remove:
+        apply_avatar(profile, remove=True)
+    messages.success(request, f"Saved {account.username}.")
+
+
+@require_staff
+def users(request):
+    if request.method == "POST":
+        action = request.POST.get("action", "")
+        if action == "create":
+            _create_account(request)
+        elif action == "save":
+            _save_account(request)
+        return redirect("users")
+    return render(request, "camera/users.html", {"rows": _user_rows(), "features": FEATURES})
+
+
+@require_login
+def account(request):
+    profile = profile_for(request.user)
+    if request.method == "POST":
+        action = request.POST.get("action", "")
+        if action == "avatar":
+            upload = request.FILES.get("avatar")
+            remove = request.POST.get("remove_avatar") == "on"
+            if upload is None and not remove:
+                messages.error(request, "Choose a picture first.")
+            else:
+                problem = apply_avatar(profile, upload=upload, remove=remove)
+                if problem:
+                    messages.error(request, problem)
+                elif upload is not None:
+                    messages.success(request, "Picture updated.")
+                else:
+                    messages.success(request, "Picture removed.")
+        elif action == "password":
+            current = request.POST.get("current_password", "")
+            new = request.POST.get("new_password", "")
+            again = request.POST.get("confirm_password", "")
+            if not request.user.check_password(current):
+                messages.error(request, "Current password is wrong.")
+            elif new != again:
+                messages.error(request, "New passwords do not match.")
+            else:
+                problem = password_problem(new, request.user)
+                if problem:
+                    messages.error(request, problem)
+                else:
+                    request.user.set_password(new)
+                    request.user.save()
+                    update_session_auth_hash(request, request.user)
+                    messages.success(request, "Password updated.")
+        return redirect("account")
+    return render(
+        request,
+        "camera/account.html",
+        {
+            "profile": profile,
+            "avatar_url": public_media_url(profile.avatar),
+            "initial": initial_for(request.user),
+        },
+    )

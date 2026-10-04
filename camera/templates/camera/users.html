@@ -1,0 +1,79 @@
+{% extends "camera/base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+  <h1>Users</h1>
+  <form class="panel" method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="create">
+    <strong>New account</strong>
+    <div class="row" style="margin-top: 12px;">
+      <label>Username
+        <input type="text" name="username" autocomplete="off" required>
+      </label>
+      <label>Password
+        <input type="password" name="password" autocomplete="new-password" required>
+      </label>
+      <label>Picture
+        <input type="file" name="avatar" accept="image/jpeg,image/png,image/webp">
+      </label>
+    </div>
+    <div class="checks">
+      <label><input type="checkbox" name="is_staff"> Admin</label>
+      {% for feature in features %}
+        <label><input type="checkbox" name="features" value="{{ feature.code }}"> {{ feature.label }}</label>
+      {% endfor %}
+    </div>
+    <p class="muted">An admin can open every feature. The ticks stay for when the account is not an admin.</p>
+    <button type="submit">Create account</button>
+  </form>
+
+  <div class="user-list" style="margin-top: 16px;">
+    {% for row in rows %}
+      <form class="panel" method="post" enctype="multipart/form-data">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="save">
+        <input type="hidden" name="user_id" value="{{ row.account.pk }}">
+        <div class="row">
+          {% if row.avatar_url %}
+            <img class="avatar" src="{{ row.avatar_url }}" alt="">
+          {% else %}
+            <span class="initial">{{ row.initial }}</span>
+          {% endif %}
+          <strong>{{ row.account.username }}</strong>
+          {% if row.account.pk == request.user.pk %}<span class="muted">You</span>{% endif %}
+          {% if row.account.is_staff %}<span class="badge admin">Admin</span>{% endif %}
+        </div>
+        <div class="checks">
+          {% if row.last_staff %}
+            <input type="hidden" name="is_staff" value="on">
+            <input type="hidden" name="is_active" value="on">
+            <label><input type="checkbox" checked disabled> Admin</label>
+            <label><input type="checkbox" checked disabled> Active</label>
+          {% else %}
+            <label><input type="checkbox" name="is_staff" {% if row.account.is_staff %}checked{% endif %}> Admin</label>
+            <label><input type="checkbox" name="is_active" {% if row.account.is_active %}checked{% endif %}> Active</label>
+          {% endif %}
+          {% for feature in features %}
+            <label>
+              <input type="checkbox" name="features" value="{{ feature.code }}" {% if feature.code in row.granted %}checked{% endif %}>
+              {{ feature.label }}
+            </label>
+          {% endfor %}
+        </div>
+        {% if row.last_staff %}<p class="muted">The last admin stays active.</p>{% endif %}
+        <div class="row">
+          <label>New password
+            <input type="password" name="password" autocomplete="new-password" placeholder="Leave blank to keep">
+          </label>
+          <label>Picture
+            <input type="file" name="avatar" accept="image/jpeg,image/png,image/webp">
+          </label>
+          {% if row.avatar_url %}
+            <label class="checks"><input type="checkbox" name="remove_avatar"> Remove picture</label>
+          {% endif %}
+          <button type="submit">Save</button>
+        </div>
+      </form>
+    {% endfor %}
+  </div>
+{% endblock %}

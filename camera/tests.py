@@ -1,11 +1,25 @@
-from django.test import TestCase
+import io
+import tempfile
+
+from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
+from PIL import Image
 
 from camera.services.dwell import DwellTracker
 from camera.services.geom import point_in_polygon
 from camera.services.rtsp import parse_channel, stream_url
 
+PORTAL_MEDIA = tempfile.mkdtemp()
 
-class ZoneGeometryTests(TestCase):
+
+class AdminClientMixin:
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(get_user_model().objects.get(username="admin"))
+
+
+class ZoneGeometryTests(AdminClientMixin, TestCase):
     def test_point_in_square(self):
         square = [[0, 0], [1, 0], [1, 1], [0, 1]]
         self.assertTrue(point_in_polygon(0.5, 0.5, square))
@@ -148,7 +162,7 @@ class ZoneGeometryTests(TestCase):
             rtsp.base_rtsp_url = original
 
 
-class NvrSettingsTests(TestCase):
+class NvrSettingsTests(AdminClientMixin, TestCase):
     def test_build_rtsp_url_encodes_special_characters(self):
         from camera.models import Nvr
         from camera.services.rtsp import base_rtsp_url, build_rtsp_url
@@ -624,7 +638,7 @@ class FaceQualityTests(TestCase):
         self.assertGreaterEqual(stamped.shape[1], crop.shape[1])
 
 
-class FaceCaptureTests(TestCase):
+class FaceCaptureTests(AdminClientMixin, TestCase):
     def _vector(self, index: int):
         import numpy as np
 
@@ -812,7 +826,7 @@ class FaceCaptureTests(TestCase):
         self.assertEqual(capture.matched_name, "Ashraf")
 
 
-class AnalyticsTests(TestCase):
+class AnalyticsTests(AdminClientMixin, TestCase):
     def test_minutes_and_seconds_add_up(self):
         from camera.services.rules import total_seconds
 
@@ -1189,7 +1203,7 @@ class AnalyticsTests(TestCase):
         self.assertIn("camera=4", response.url)
 
 
-class ListPageTests(TestCase):
+class ListPageTests(AdminClientMixin, TestCase):
     def _stamp(self, model):
         from datetime import timedelta
 
@@ -1339,3 +1353,99 @@ class ListPageTests(TestCase):
             {"person": person.pk, "page": "3"},
         )
         self.assertRedirects(response, "/recognition/?page=3", fetch_redirect_response=False)
+
+
+def _png(name="face.png"):
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (215, 164, 65)).save(buffer, format="PNG")
+    return SimpleUploadedFile(name, buffer.getvalue(), content_type="image/png")
+
+
+@override_settings(MEDIA_ROOT=PORTAL_MEDIA)
+class PortalAccessTests(TestCase):
+    def test_login_page_hides_passwords_and_rejects_a_bad_one(self):
+        page = self.client.get("/login/")
+        self.assertNotContains(page, "Admin1234")
+        self.assertNotContains(page, "User1234")
+        rejected = self.client.post("/login/", {"username": "user", "password": "wrong-password"})
+        self.assertContains(rejected, "Those details were not recognised.")
+
+    def test_known_user_reaches_the_portal(self):
+        response = self.client.post("/login/", {"username": "user", "password": "User1234"})
+        self.assertRedirects(response, "/portal/")
+        page = self.client.get("/portal/")
+        self.assertContains(page, "Hello, user")
+        self.assertContains(page, 'href="/alarms/"')
+        self.assertContains(page, "alarms in the last 24 hours")
+        self.assertNotContains(page, 'href="/settings/"')
+        self.assertNotContains(page, 'href="/users/"')
+
+    def test_anonymous_pages_go_to_login_and_status_stays_json(self):
+        page = self.client.get("/alarms/")
+        self.assertRedirects(page, "/login/?next=/alarms/")
+        status = self.client.get("/status/")
+        self.assertEqual(status.status_code, 401)
+        self.assertEqual(status.json(), {"ok": False})
+
+    def test_missing_feature_returns_json_or_the_portal(self):
+        operator = get_user_model().objects.get(username="user")
+        operator.feature_grants.filter(feature="live").delete()
+        self.client.force_login(operator)
+        status = self.client.get("/status/")
+        self.assertEqual(status.status_code, 403)
+        self.assertRedirects(self.client.get("/settings/"), "/portal/")
+
+    def test_admin_grant_opens_settings_and_the_nav(self):
+        User = get_user_model()
+        operator = User.objects.get(username="user")
+        self.client.force_login(User.objects.get(username="admin"))
+        saved = self.client.post(
+            "/users/",
+            {
+                "action": "save",
+                "user_id": operator.pk,
+                "is_active": "on",
+                "features": ["live", "alarms", "recognition", "search", "settings"],
+            },
+        )
+        self.assertRedirects(saved, "/users/")
+        self.client.force_login(operator)
+        self.assertEqual(self.client.get("/settings/").status_code, 200)
+        page = self.client.get("/portal/")
+        self.assertContains(page, 'href="/settings/"')
+
+    def test_last_admin_cannot_be_removed(self):
+        User = get_user_model()
+        admin = User.objects.get(username="admin")
+        self.client.force_login(admin)
+        self.client.post("/users/", {"action": "save", "user_id": admin.pk})
+        admin.refresh_from_db()
+        self.assertTrue(admin.is_staff)
+        self.assertTrue(admin.is_active)
+        page = self.client.get("/users/")
+        self.assertContains(page, "The last admin has to stay an active admin.")
+
+    def test_operator_cannot_open_user_management(self):
+        self.client.force_login(get_user_model().objects.get(username="user"))
+        self.assertRedirects(self.client.get("/users/"), "/portal/")
+
+    def test_picture_is_saved_and_people_records_stay_untouched(self):
+        from camera.models import Person
+
+        before = Person.objects.count()
+        self.client.force_login(get_user_model().objects.get(username="user"))
+        saved = self.client.post("/account/", {"action": "avatar", "avatar": _png()})
+        self.assertRedirects(saved, "/account/", fetch_redirect_response=False)
+        page = self.client.get("/account/")
+        self.assertContains(page, "Picture updated.")
+        self.assertContains(page, "/media/avatars/")
+        self.assertEqual(Person.objects.count(), before)
+
+    def test_wrong_picture_type_is_refused(self):
+        self.client.force_login(get_user_model().objects.get(username="user"))
+        note = SimpleUploadedFile("note.txt", b"hello", content_type="text/plain")
+        self.client.post("/account/", {"action": "avatar", "avatar": note})
+        page = self.client.get("/account/")
+        self.assertContains(page, "Use a JPEG, PNG, or WEBP picture.")
+        account = get_user_model().objects.get(username="user")
+        self.assertFalse(account.profile.avatar)

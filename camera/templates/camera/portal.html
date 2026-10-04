@@ -1,0 +1,23 @@
+{% extends "camera/base.html" %}
+{% block title %}Portal{% endblock %}
+{% block content %}
+  <h1>Hello, {{ request.user.username }}</h1>
+  {% if recent_alarms is not None %}
+    <div class="panel stat">
+      <strong>{{ recent_alarms }}</strong>
+      <span class="muted"> alarms in the last 24 hours</span>
+    </div>
+  {% endif %}
+  {% if features %}
+    <div class="modules">
+      {% for feature in features %}
+        <a class="module" href="{% url feature.url_name %}">
+          <strong>{{ feature.label }}</strong>
+          <span class="muted">{{ feature.summary }}</span>
+        </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="panel">An admin has not opened any features for this account yet.</div>
+  {% endif %}
+{% endblock %}

@@ -1,4 +1,14 @@
+import uuid
+
+from django.conf import settings
 from django.db import models
+
+
+def avatar_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "jpg"
+    if ext not in {"jpg", "jpeg", "png", "webp"}:
+        ext = "jpg"
+    return f"avatars/{instance.user_id}-{uuid.uuid4().hex}.{ext}"
 
 
 class Zone(models.Model):
@@ -147,3 +157,24 @@ class FaceCapture(models.Model):
 
     def __str__(self) -> str:
         return f"Camera {self.camera_number} {self.matched_name or 'Unknown'}"
+
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, related_name="profile", on_delete=models.CASCADE)
+    avatar = models.ImageField(upload_to=avatar_upload_to, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.user} profile"
+
+
+class FeatureGrant(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="feature_grants", on_delete=models.CASCADE)
+    feature = models.CharField(max_length=32)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "feature"], name="uniq_user_feature"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user} {self.feature}"

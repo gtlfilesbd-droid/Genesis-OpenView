@@ -1,0 +1,39 @@
+{% extends "camera/base.html" %}
+{% block title %}Account{% endblock %}
+{% block content %}
+  <h1>Account</h1>
+  <div class="split">
+    <form class="panel stack" method="post" enctype="multipart/form-data">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="avatar">
+      <strong>Picture</strong>
+      {% if avatar_url %}
+        <img class="avatar lg" src="{{ avatar_url }}" alt="">
+      {% else %}
+        <span class="initial lg">{{ initial }}</span>
+      {% endif %}
+      <label>JPEG, PNG, or WEBP, up to 2 MB
+        <input type="file" name="avatar" accept="image/jpeg,image/png,image/webp">
+      </label>
+      {% if avatar_url %}
+        <label class="checks"><input type="checkbox" name="remove_avatar"> Remove the current picture</label>
+      {% endif %}
+      <div><button type="submit">Save picture</button></div>
+    </form>
+    <form class="panel stack" method="post">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="password">
+      <strong>Password</strong>
+      <label>Current password
+        <input type="password" name="current_password" autocomplete="current-password" required>
+      </label>
+      <label>New password
+        <input type="password" name="new_password" autocomplete="new-password" required>
+      </label>
+      <label>Confirm new password
+        <input type="password" name="confirm_password" autocomplete="new-password" required>
+      </label>
+      <div><button type="submit">Update password</button></div>
+    </form>
+  </div>
+{% endblock %}
