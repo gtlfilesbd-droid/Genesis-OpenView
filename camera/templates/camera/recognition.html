@@ -3,47 +3,48 @@
 {% block content %}
 <h1>Recognition</h1>
 <p class="muted">Clear faces from the camera that is running. The time under each photo is when that frame was saved.</p>
-{% if not captures %}
-  <p class="muted">No faces captured yet. Start a camera and a clear face will appear here.</p>
-{% else %}
-  <div class="cards">
-    {% for capture in captures %}
-    <article class="panel">
-      <img class="shot" src="{{ capture.face_crop.url }}" alt="Captured face">
-      <p>
-        <strong>{{ capture.matched_name|default:"Unknown" }}</strong>
-        {% if capture.person %}
-          <span class="badge {{ capture.person.list_status }}">{{ capture.person.list_status }}</span>
-        {% else %}
-          <span class="badge unknown">unknown</span>
-        {% endif %}
-      </p>
-      <p class="muted">Camera {{ capture.camera_number }}<br>{{ capture.created_at|date:"Y-m-d H:i:s" }}</p>
-      {% if capture.match_score is not None %}<p class="muted">Score {{ capture.match_score|floatformat:3 }}</p>{% endif %}
-      <form method="post" action="{% url 'capture_classify' capture.pk %}">
-        {% csrf_token %}
-        <label>Name <input name="name" value="{{ capture.matched_name }}" required></label>
-        <div class="row">
-          <button type="submit" name="list_status" value="whitelist">Whitelist</button>
-          <button class="danger" type="submit" name="list_status" value="blacklist">Blacklist</button>
-        </div>
-      </form>
-      {% if people %}
-      <form method="post" action="{% url 'capture_sample' capture.pk %}">
-        {% csrf_token %}
-        <label>Existing person
-          <select name="person" required>
-            <option value="">Choose</option>
-            {% for person in people %}
-              <option value="{{ person.pk }}">{{ person.name }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <button class="ghost" type="submit">Add to profile</button>
-      </form>
+{% for capture in captures %}
+  {% if forloop.first %}<div class="cards">{% endif %}
+  <article class="panel">
+    <img class="shot" src="{{ capture.face_crop.url }}" alt="Captured face">
+    <p>
+      <strong>{{ capture.matched_name|default:"Unknown" }}</strong>
+      {% if capture.person %}
+        <span class="badge {{ capture.person.list_status }}">{{ capture.person.list_status }}</span>
+      {% else %}
+        <span class="badge unknown">unknown</span>
       {% endif %}
-    </article>
-    {% endfor %}
-  </div>
-{% endif %}
+    </p>
+    <p class="muted">Camera {{ capture.camera_number }}<br>{{ capture.created_at|date:"Y-m-d H:i:s" }}</p>
+    {% if capture.match_score is not None %}<p class="muted">Score {{ capture.match_score|floatformat:3 }}</p>{% endif %}
+    <form method="post" action="{% url 'capture_classify' capture.pk %}">
+      {% csrf_token %}
+      <input type="hidden" name="page" value="{{ captures.number }}">
+      <label>Name <input name="name" value="{{ capture.matched_name }}" required></label>
+      <div class="row">
+        <button type="submit" name="list_status" value="whitelist">Whitelist</button>
+        <button class="danger" type="submit" name="list_status" value="blacklist">Blacklist</button>
+      </div>
+    </form>
+    {% if people %}
+    <form method="post" action="{% url 'capture_sample' capture.pk %}">
+      {% csrf_token %}
+      <input type="hidden" name="page" value="{{ captures.number }}">
+      <label>Existing person
+        <select name="person" required>
+          <option value="">Choose</option>
+          {% for person in people %}
+            <option value="{{ person.pk }}">{{ person.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="ghost" type="submit">Add to profile</button>
+    </form>
+    {% endif %}
+  </article>
+  {% if forloop.last %}</div>{% endif %}
+{% empty %}
+  <p class="muted">No faces captured yet. Start a camera and a clear face will appear here.</p>
+{% endfor %}
+{% include "camera/pager.html" with page=captures %}
 {% endblock %}

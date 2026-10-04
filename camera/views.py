@@ -4,8 +4,10 @@ import time
 
 from django.contrib import messages
 from django.core.files.base import ContentFile
+from django.core.paginator import Paginator
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from .models import Alarm, AnalyticsRule, FaceCapture, Nvr, Person, PersonSample
@@ -246,14 +248,59 @@ def zone_frame(request):
     return response
 
 
+ALARM_PAGE_SIZE = 50
+RECOGNITION_PAGE_SIZE = 80
+
+
+def _page_numbers(page, radius: int = 2) -> list:
+    """Page links around the current page, with gaps marked as None."""
+    last = page.paginator.num_pages
+    if last <= 1:
+        return []
+    wanted = {1, last, page.number}
+    for number in range(page.number - radius, page.number + radius + 1):
+        if 1 <= number <= last:
+            wanted.add(number)
+    ordered = sorted(wanted)
+    window = []
+    previous = 0
+    for number in ordered:
+        if previous and number - previous > 1:
+            window.append(None)
+        window.append(number)
+        previous = number
+    return window
+
+
+def _page(request, queryset, per_page):
+    page = Paginator(queryset, per_page).get_page(request.GET.get("page"))
+    return page, _page_numbers(page)
+
+
+def _recognition_redirect(request):
+    raw = (request.POST.get("page") or "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return redirect(f"{reverse('recognition')}?page={int(raw)}")
+    return redirect("recognition")
+
+
 def alarms(request):
-    return render(request, "camera/alarms.html", {"alarms": Alarm.objects.all()[:50]})
+    alarms, page_numbers = _page(request, Alarm.objects.defer("face_embedding"), ALARM_PAGE_SIZE)
+    return render(request, "camera/alarms.html", {"alarms": alarms, "page_numbers": page_numbers})
 
 
 def recognition(request):
-    captures = FaceCapture.objects.select_related("person")[:80]
+    captures, page_numbers = _page(
+        request,
+        FaceCapture.objects.select_related("person").defer("embedding"),
+        RECOGNITION_PAGE_SIZE,
+    )
     people = Person.objects.order_by("name")
-    return render(request, "camera/recognition.html", {"captures": captures, "people": people})
+    return render(
+        request,
+        "camera/recognition.html",
+        {"captures": captures, "people": people, "page_numbers": page_numbers},
+    )
 
 
 def _add_capture_sample(person, capture) -> None:
@@ -273,17 +320,17 @@ def capture_classify(request, pk):
     status = _list_status(request.POST.get("list_status") or "")
     if not status or not name:
         messages.error(request, "Enter a name and choose whitelist or blacklist.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     vector = current_vector(bytes(capture.embedding) if capture.embedding else None)
     if vector is None:
         messages.error(request, "This capture has no usable face vector.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     payload = _read_field(capture.face_crop)
     person = Person.objects.filter(name__iexact=name).first()
     if person is None:
         if not payload:
             messages.error(request, "This capture has no face photo.")
-            return redirect("recognition")
+            return _recognition_redirect(request)
         person = Person(name=name, list_status=status, embedding=to_bytes(vector))
         person.photo.save(f"{capture.pk}.jpg", ContentFile(payload), save=False)
         person.save()
@@ -300,7 +347,7 @@ def capture_classify(request, pk):
         _add_capture_sample(person, other)
     engine._gallery_at = 0.0
     messages.success(request, f"{person.name} is on the {status}.")
-    return redirect("recognition")
+    return _recognition_redirect(request)
 
 
 @require_POST
@@ -315,28 +362,28 @@ def capture_sample(request, pk):
     person = Person.objects.filter(pk=person_id).first()
     if person is None:
         messages.error(request, "Choose a person.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     vector = current_vector(bytes(capture.embedding) if capture.embedding else None)
     payload = _read_field(capture.face_crop)
     if vector is None or not payload:
         messages.error(request, "This capture has no usable face photo.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     reason = sample_skip_reason(person, vector)
     if reason == "duplicate":
         messages.error(request, f"This photo is already on {person.name}'s profile.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     if reason == "full":
         messages.error(request, f"{person.name} already has 12 sample photos.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     if reason or not add_sample(person, payload, vector, f"{capture.pk}.jpg"):
         messages.error(request, "This snap was not added.")
-        return redirect("recognition")
+        return _recognition_redirect(request)
     capture.person = person
     capture.matched_name = person.name
     capture.save(update_fields=["person", "matched_name"])
     engine._gallery_at = 0.0
     messages.success(request, f"Added this snap to {person.name}.")
-    return redirect("recognition")
+    return _recognition_redirect(request)
 
 
 def _embed_upload(upload):

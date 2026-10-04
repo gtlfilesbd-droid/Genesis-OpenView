@@ -2,19 +2,18 @@
 {% block title %}Alarms{% endblock %}
 {% block content %}
 <h1>Alarms</h1>
-{% if not alarms %}
+{% for alarm in alarms %}
+  {% if forloop.first %}<div class="cards">{% endif %}
+  <article class="panel">
+    <img class="shot" src="{{ alarm.snapshot.url }}" alt="Alarm snapshot">
+    <p><strong>{{ alarm.kind_label }}</strong> · {{ alarm.matched_name }}</p>
+    <p class="muted">Camera {{ alarm.camera_number }} · ID {{ alarm.track_id }}<br>{{ alarm.created_at|date:"Y-m-d H:i:s" }}</p>
+    {% if alarm.score is not None %}<p class="muted">Score {{ alarm.score|floatformat:3 }}</p>{% endif %}
+    {% if alarm.face_crop %}<img class="shot" src="{{ alarm.face_crop.url }}" alt="Face crop">{% endif %}
+  </article>
+  {% if forloop.last %}</div>{% endif %}
+{% empty %}
   <p class="muted">No alarms yet. Saved analytics rules raise an alarm when their wait is met.</p>
-{% else %}
-  <div class="cards">
-    {% for alarm in alarms %}
-      <article class="panel">
-        <img class="shot" src="{{ alarm.snapshot.url }}" alt="Alarm snapshot">
-        <p><strong>{{ alarm.kind_label }}</strong> · {{ alarm.matched_name }}</p>
-        <p class="muted">Camera {{ alarm.camera_number }} · ID {{ alarm.track_id }}<br>{{ alarm.created_at|date:"Y-m-d H:i:s" }}</p>
-        {% if alarm.score is not None %}<p class="muted">Score {{ alarm.score|floatformat:3 }}</p>{% endif %}
-        {% if alarm.face_crop %}<img class="shot" src="{{ alarm.face_crop.url }}" alt="Face crop">{% endif %}
-      </article>
-    {% endfor %}
-  </div>
-{% endif %}
+{% endfor %}
+{% include "camera/pager.html" with page=alarms %}
 {% endblock %}

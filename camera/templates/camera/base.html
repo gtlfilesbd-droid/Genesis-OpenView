@@ -126,6 +126,18 @@
     .messages { list-style: none; padding: 0; }
     .messages li { padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; background: #243028; }
     .messages .error { background: #3a2020; }
+    .pager { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 16px; }
+    .pager a, .pager-current, .pager-edge {
+      min-width: 2.2rem;
+      text-align: center;
+      text-decoration: none;
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    .pager a { color: var(--text); background: #12161b; border: 1px solid var(--line); }
+    .pager a:hover, .pager-current { background: var(--accent); color: #1a1408; border-color: transparent; }
+    .pager-current { display: inline-block; font-weight: 650; }
+    .pager-edge { color: var(--muted); border: 1px solid var(--line); }
     @media (max-width: 800px) {
       .layout { grid-template-columns: 1fr; }
       header { flex-direction: column; align-items: flex-start; }

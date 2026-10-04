@@ -1187,3 +1187,155 @@ class AnalyticsTests(TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn("kind=zone", response.url)
         self.assertIn("camera=4", response.url)
+
+
+class ListPageTests(TestCase):
+    def _stamp(self, model):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        moment = timezone.now()
+        ordered = list(model.objects.order_by("pk"))
+        for index, row in enumerate(ordered):
+            row.created_at = moment - timedelta(minutes=index)
+        model.objects.bulk_update(ordered, ["created_at"])
+
+    def _alarms(self, count):
+        from camera.models import Alarm
+
+        Alarm.objects.bulk_create(
+            [
+                Alarm(
+                    camera_number=1,
+                    track_id=index,
+                    snapshot=f"alarms/{index}.jpg",
+                    matched_name="Newest alarm" if index == 0 else "Oldest alarm" if index == count - 1 else f"Alarm {index}",
+                )
+                for index in range(count)
+            ]
+        )
+        self._stamp(Alarm)
+
+    def _captures(self, count):
+        from camera.models import FaceCapture
+
+        FaceCapture.objects.bulk_create(
+            [
+                FaceCapture(
+                    camera_number=1,
+                    track_id=index,
+                    face_crop=f"captures/{index}.jpg",
+                    embedding=b"x",
+                    matched_name="Newest face" if index == 0 else "Oldest face" if index == count - 1 else f"Face {index}",
+                )
+                for index in range(count)
+            ]
+        )
+        self._stamp(FaceCapture)
+
+    def test_alarm_page_two_shows_the_older_rows(self):
+        from camera.views import ALARM_PAGE_SIZE
+
+        self._alarms(ALARM_PAGE_SIZE + 1)
+        first = self.client.get("/alarms/")
+        second = self.client.get("/alarms/?page=2")
+        self.assertContains(first, "Newest alarm")
+        self.assertNotContains(first, "Oldest alarm")
+        self.assertContains(first, 'href="?page=2"')
+        self.assertContains(second, "Oldest alarm")
+        self.assertNotContains(second, "Newest alarm")
+
+    def test_recognition_page_two_shows_the_older_rows(self):
+        from camera.views import RECOGNITION_PAGE_SIZE
+
+        self._captures(RECOGNITION_PAGE_SIZE + 1)
+        first = self.client.get("/recognition/")
+        second = self.client.get("/recognition/?page=2")
+        self.assertContains(first, "Newest face")
+        self.assertNotContains(first, "Oldest face")
+        self.assertContains(second, "Oldest face")
+        self.assertNotContains(second, "Newest face")
+
+    def test_invalid_page_does_not_error(self):
+        from camera.views import ALARM_PAGE_SIZE
+
+        self._alarms(ALARM_PAGE_SIZE + 1)
+        letters = self.client.get("/alarms/?page=abc")
+        huge = self.client.get("/alarms/?page=999")
+        zero = self.client.get("/recognition/?page=0")
+        self.assertEqual(letters.status_code, 200)
+        self.assertContains(letters, "Newest alarm")
+        self.assertEqual(huge.status_code, 200)
+        self.assertContains(huge, "Oldest alarm")
+        self.assertEqual(zero.status_code, 200)
+
+    def test_single_page_has_no_pager(self):
+        self._alarms(1)
+        alarms = self.client.get("/alarms/")
+        recognition = self.client.get("/recognition/")
+        self.assertContains(alarms, "Newest alarm")
+        self.assertNotContains(alarms, 'class="pager"')
+        self.assertContains(recognition, "No faces captured yet")
+        self.assertNotContains(recognition, 'class="pager"')
+
+    def test_empty_alarm_list_keeps_its_message(self):
+        page = self.client.get("/alarms/")
+        self.assertContains(page, "No alarms yet")
+        self.assertNotContains(page, 'class="pager"')
+
+    def test_classify_returns_to_the_posted_page(self):
+        import cv2
+        import numpy as np
+        from django.core.files.base import ContentFile
+
+        from camera.models import FaceCapture
+        from camera.services.faces import to_bytes
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        vector = np.zeros(512, dtype=np.float32)
+        vector[0] = 1
+        capture = FaceCapture(camera_number=1, track_id=1, embedding=to_bytes(vector), det_score=0.9, quality=1.0)
+        capture.face_crop.save("face.jpg", ContentFile(encoded.tobytes()), save=True)
+        kept = self.client.post(
+            f"/recognition/{capture.pk}/list/",
+            {"name": "Ashraf", "list_status": "whitelist", "page": "2"},
+        )
+        self.assertRedirects(kept, "/recognition/?page=2", fetch_redirect_response=False)
+        fresh = self.client.post(
+            f"/recognition/{capture.pk}/list/",
+            {"name": "Ashraf", "list_status": "whitelist"},
+        )
+        self.assertRedirects(fresh, "/recognition/", fetch_redirect_response=False)
+
+    def test_sample_returns_to_the_posted_page(self):
+        import cv2
+        import numpy as np
+        from django.core.files.base import ContentFile
+
+        from camera.models import FaceCapture, Person
+        from camera.services.faces import to_bytes
+        from camera.services.gallery import add_sample
+
+        image = np.zeros((48, 48, 3), dtype=np.uint8)
+        ok, encoded = cv2.imencode(".jpg", image)
+        self.assertTrue(ok)
+        jpeg = encoded.tobytes()
+        front = np.zeros(512, dtype=np.float32)
+        front[0] = 1
+        person = Person(name="Ashraf", list_status=Person.WHITELIST, embedding=to_bytes(front))
+        person.photo.save("cover.jpg", ContentFile(jpeg), save=True)
+        self.assertTrue(add_sample(person, jpeg, front, "front.jpg"))
+        side = np.zeros(512, dtype=np.float32)
+        side[0] = 0.6
+        side[1] = 0.8
+        side /= np.linalg.norm(side)
+        capture = FaceCapture(camera_number=1, track_id=4, embedding=to_bytes(side), det_score=0.91, quality=1.1)
+        capture.face_crop.save("snap.jpg", ContentFile(jpeg), save=True)
+        response = self.client.post(
+            f"/recognition/{capture.pk}/sample/",
+            {"person": person.pk, "page": "3"},
+        )
+        self.assertRedirects(response, "/recognition/?page=3", fetch_redirect_response=False)

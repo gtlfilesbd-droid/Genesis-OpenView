@@ -1,0 +1,25 @@
+{% if page.has_other_pages %}
+<nav class="pager" aria-label="Pages">
+  {% if page.has_previous %}
+    <a class="button ghost" href="?page={{ page.previous_page_number }}">Previous</a>
+  {% else %}
+    <span class="pager-edge">Previous</span>
+  {% endif %}
+  {% for item in page_numbers %}
+    {% if item %}
+      {% if item == page.number %}
+        <span class="pager-current" aria-current="page">{{ item }}</span>
+      {% else %}
+        <a href="?page={{ item }}">{{ item }}</a>
+      {% endif %}
+    {% else %}
+      <span class="muted" aria-hidden="true">&hellip;</span>
+    {% endif %}
+  {% endfor %}
+  {% if page.has_next %}
+    <a class="button ghost" href="?page={{ page.next_page_number }}">Next</a>
+  {% else %}
+    <span class="pager-edge">Next</span>
+  {% endif %}
+</nav>
+{% endif %}

@@ -109,7 +109,7 @@ class PersonSample(models.Model):
 
 
 class Alarm(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     camera_number = models.PositiveIntegerField()
     track_id = models.IntegerField()
     snapshot = models.ImageField(upload_to="alarms/")
@@ -131,7 +131,7 @@ class Alarm(models.Model):
 
 
 class FaceCapture(models.Model):
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     camera_number = models.PositiveIntegerField()
     track_id = models.IntegerField()
     face_crop = models.ImageField(upload_to="captures/")
